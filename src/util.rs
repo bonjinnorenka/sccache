@@ -1694,13 +1694,13 @@ pub fn resolve_compiler_avoiding_wrapper(
     executable.to_path_buf()
 }
 
-/// Byte used as a basedir placeholder inside cached dep-info files.
-/// It can never appear in a real dep-info, since makefile paths may not
-/// contain control characters.
-const DEPINFO_BASEDIR_MARK: u8 = 0x01;
+/// Markers used inside cached dep-info: 0x01 = raw-spelled basedir,
+/// 0x02 = make-escaped-spelled basedir. Control bytes cannot appear in real
+/// dep-info paths.
+const DEPINFO_MARK_RAW: u8 = 0x01;
+const DEPINFO_MARK_ESCAPED: u8 = 0x02;
 
-/// Escape `p` the way make depfiles spell path characters that would
-/// otherwise break parsing (' ', '#', '\\', '$').
+/// Escape `p` the way make depfiles spell characters that would break parsing.
 fn depinfo_escape(p: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(p.len() + 8);
     for &b in p {
@@ -1712,24 +1712,28 @@ fn depinfo_escape(p: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Replace every occurrence of `basedir` in `content` (raw and make-escaped
-/// spellings) with the basedir marker byte. Basedirs always end in '/', so the
-/// marker directly precedes the remainder of the path.
+/// A basedir occurrence only counts at a path-token start: beginning of the
+/// content, or right after a space, ':', '=', '\\' or newline. Mid-token
+/// matches (e.g. a foreign path that merely contains the basedir string) are
+/// left alone.
+fn depinfo_at_token_start(content: &[u8], i: usize) -> bool {
+    i == 0 || matches!(content[i - 1], b' ' | b':' | b'=' | b'\\' | b'\n')
+}
+
+/// Replace `basedir` occurrences at path-token starts with marker bytes
+/// (raw spelling -> 0x01, make-escaped spelling -> 0x02).
 pub fn depinfo_mark_basedir(content: &[u8], basedir: &[u8]) -> Vec<u8> {
     let escaped = depinfo_escape(basedir);
     let mut out = Vec::with_capacity(content.len());
     let mut i = 0;
     while i < content.len() {
-        if content[i..].starts_with(basedir)
-            || (escaped != basedir && content[i..].starts_with(&escaped))
-        {
-            out.push(DEPINFO_BASEDIR_MARK);
-            let n = if content[i..].starts_with(basedir) {
-                basedir.len()
-            } else {
-                escaped.len()
-            };
-            i += n;
+        let at_start = depinfo_at_token_start(content, i);
+        if at_start && content[i..].starts_with(basedir) {
+            out.push(DEPINFO_MARK_RAW);
+            i += basedir.len();
+        } else if at_start && escaped != basedir && content[i..].starts_with(&escaped) {
+            out.push(DEPINFO_MARK_ESCAPED);
+            i += escaped.len();
         } else {
             out.push(content[i]);
             i += 1;
@@ -1738,21 +1742,25 @@ pub fn depinfo_mark_basedir(content: &[u8], basedir: &[u8]) -> Vec<u8> {
     out
 }
 
-/// True when `content` carries basedir markers from a storing compile.
+/// True when `content` carries either dep-info basedir marker.
 pub fn depinfo_has_marker(content: &[u8]) -> bool {
-    content.contains(&DEPINFO_BASEDIR_MARK)
+    content
+        .iter()
+        .any(|b| *b == DEPINFO_MARK_RAW || *b == DEPINFO_MARK_ESCAPED)
 }
 
-/// Replace basedir markers in `content` with `basedir`. The caller must only
-/// use this when the request has exactly one basedir; otherwise the marker's
-/// origin is ambiguous.
+/// Replace markers with `basedir` (raw markers) or its make-escaped spelling
+/// (escaped markers). Any other control byte left in the output would mean a
+/// foreign marker from a different cache format; callers detect that via
+/// `depinfo_has_marker`.
 pub fn depinfo_resolve_basedir(content: &[u8], basedir: &[u8]) -> Vec<u8> {
+    let escaped = depinfo_escape(basedir);
     let mut out = Vec::with_capacity(content.len() + 64);
     for &b in content {
-        if b == DEPINFO_BASEDIR_MARK {
-            out.extend_from_slice(basedir);
-        } else {
-            out.push(b);
+        match b {
+            DEPINFO_MARK_RAW => out.extend_from_slice(basedir),
+            DEPINFO_MARK_ESCAPED => out.extend_from_slice(&escaped),
+            _ => out.push(b),
         }
     }
     out
@@ -1760,7 +1768,7 @@ pub fn depinfo_resolve_basedir(content: &[u8], basedir: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Digest, OsStrExt, TimeMacroFinder, resolve_compiler_avoiding_wrapper};
+    use super::{Digest, OsStrExt, TimeMacroFinder, depinfo_has_marker, depinfo_mark_basedir, depinfo_resolve_basedir, resolve_compiler_avoiding_wrapper};
     use std::ffi::{OsStr, OsString};
     use std::path::Path;
 
@@ -2558,5 +2566,73 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn depinfo_mark_resolve_roundtrip() {
+        let bd = b"/content/runner-jit-slot-0/";
+        let src = br"/content/runner-jit-slot-0/w/t.d: /content/runner-jit-slot-0/h/.cargo/r/a.rs
+# env-dep:OUT_DIR=/content/runner-jit-slot-0/w/out
+";
+        let marked = depinfo_mark_basedir(src, bd);
+        assert!(depinfo_has_marker(&marked));
+        let out = depinfo_resolve_basedir(&marked, b"/content/runner-jit-slot-1/");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("/content/runner-jit-slot-1/w/t.d"));
+        assert!(text.contains("env-dep:OUT_DIR=/content/runner-jit-slot-1/w/out"));
+        assert!(!text.contains("slot-0"));
+    }
+
+    #[test]
+    fn depinfo_escaped_paths_stay_escaped() {
+        let bd = b"/tmp/sl ot/";
+        let src = br"/tmp/sl\ ot/w/t.d: /tmp/sl\ ot/s/a\ b.rs
+";
+        let marked = depinfo_mark_basedir(src, bd);
+        let out = depinfo_resolve_basedir(&marked, b"/x/y z/");
+        assert!(out.windows(8).any(|w| w == br"/x/y\ z/"));
+        assert!(!out.windows(7).any(|w| w == b"/x/y z/"));
+    }
+
+    #[test]
+    fn depinfo_no_midtoken_match() {
+        let bd = b"/a/b/";
+        let src = br"/pre/a/b/x.d: /pre/a/b/x.rs /a/b/y.rs
+";
+        let marked = depinfo_mark_basedir(src, bd);
+        let out = depinfo_resolve_basedir(&marked, b"/c/");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("/pre/a/b/x.d") && text.contains("/c/y.rs"));
+    }
+
+    #[test]
+    fn depinfo_sibling_not_matched() {
+        let bd = b"/base/dir/";
+        let src = br"/base/dir-extra/x.d: /base/dir-extra/x.rs
+";
+        assert!(!depinfo_has_marker(&depinfo_mark_basedir(src, bd)));
+    }
+
+    #[test]
+    fn depinfo_no_basedir_no_marker() {
+        let src = br"/x/t.d: /x/a.rs /y/b.rs
+";
+        assert!(!depinfo_has_marker(&depinfo_mark_basedir(src, b"/none/")));
+    }
+
+    #[test]
+    fn depinfo_non_utf8_safe() {
+        let src = b"/a/t.d: /a/b/\xff\xfe.rs\n";
+        let marked = depinfo_mark_basedir(src, b"/a/");
+        let out = depinfo_resolve_basedir(&marked, b"/z/");
+        assert!(out.windows(7).any(|w| w == b"/z/b/\xff\xfe"));
+    }
+
+    #[test]
+    fn depinfo_foreign_marker_unchanged() {
+        let src = b"/x/t.d: \x03foo\n";
+        let out = depinfo_resolve_basedir(src, b"/a/");
+        assert_eq!(out, src);
+        assert!(!depinfo_has_marker(&out));
     }
 }

@@ -654,34 +654,68 @@ where
                 };
 
                 let hit = CompileResult::CacheHit(duration);
-                match entry.extract_objects(filtered_outputs.clone(), &pool).await {
-                    Ok(()) => {
-                        // Dep-info restored verbatim names the storing build
-                        // root. Stored files carry basedir markers, so map them
-                        // back onto this request's build root when unambiguous.
-                        let basedirs = storage.basedirs();
-                        let mut depinfo_ok = true;
-                        for fobj in &filtered_outputs {
-                            if !fobj.key.ends_with(".d") {
-                                continue;
+                // Rust dep-info: validate resolvability BEFORE extracting so a
+                // reject leaves no partial outputs on disk.
+                let basedirs = storage.basedirs();
+                let is_rust = self.language() == Language::Rust;
+                let mut depinfo_rewrites: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
+                let mut depinfo_ok = true;
+                if is_rust {
+                    for fobj in &filtered_outputs {
+                        if !fobj.key.ends_with(".d") {
+                            continue;
+                        }
+                        let mut raw_buf = Vec::new();
+                        match entry.get_object(&fobj.key, &mut raw_buf).map(|_| raw_buf) {
+                            Ok(raw) => {
+                                if depinfo_has_marker(&raw) {
+                                    if basedirs.len() == 1 {
+                                        depinfo_rewrites.push((
+                                            fobj.path.clone(),
+                                            depinfo_resolve_basedir(&raw, &basedirs[0]),
+                                        ));
+                                    } else {
+                                        depinfo_ok = false;
+                                        break;
+                                    }
+                                } else if basedirs.len() >= 2 {
+                                    // Unmarked dep-info from a multi-basedir
+                                    // store could name a foreign root.
+                                    depinfo_ok = false;
+                                    break;
+                                }
                             }
-                            let Ok(raw) = fs::read(&fobj.path) else {
-                                continue;
-                            };
-                            if !depinfo_has_marker(&raw) {
-                                continue;
-                            }
-                            if basedirs.len() != 1 {
+                            Err(_) => {
                                 depinfo_ok = false;
                                 break;
                             }
-                            fs::write(&fobj.path, depinfo_resolve_basedir(&raw, &basedirs[0]))?;
                         }
-                        if depinfo_ok {
+                    }
+                }
+                if !depinfo_ok {
+                    debug!(
+                        "[{}]: dep-info not safely resolvable, treating as miss",
+                        out_pretty
+                    );
+                    Ok(CacheLookupResult::Miss(MissType::Normal))
+                } else {
+                match entry.extract_objects(filtered_outputs.clone(), &pool).await {
+                    Ok(()) => {
+                        let mut ok = true;
+                        for (path, content) in depinfo_rewrites {
+                            if fs::write(&path, &content).is_err() {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
                             Ok(CacheLookupResult::Success(hit, output))
                         } else {
+                            for fobj in &filtered_outputs {
+                                let _ = fs::remove_file(&fobj.path);
+                            }
                             debug!(
-                                "[{}]: dep-info markers without a single basedir, treating as miss",
+                                "[{}]: dep-info rewrite failed, treating as miss",
                                 out_pretty
                             );
                             Ok(CacheLookupResult::Miss(MissType::Normal))
@@ -695,6 +729,7 @@ where
                             Err(e)
                         }
                     }
+                }
                 }
             }
             (Ok(Ok(Cache::Miss)), duration) => {

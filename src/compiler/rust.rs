@@ -238,7 +238,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"8";
+const CACHE_VERSION: &[u8] = b"9";
 
 fn hash_rust_value(digest: &mut Digest, value: &OsStr, basedirs: Option<&[Vec<u8>]>) {
     let encoded = encode_rust_value(value);
