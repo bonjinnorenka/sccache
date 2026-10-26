@@ -238,7 +238,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"7";
+const CACHE_VERSION: &[u8] = b"8";
 
 fn hash_rust_value(digest: &mut Digest, value: &OsStr, basedirs: Option<&[Vec<u8>]>) {
     let encoded = encode_rust_value(value);
@@ -1648,7 +1648,11 @@ where
         m.update(&(env_deps.len() as u64).to_le_bytes());
         for (var, val) in env_deps.iter() {
             hash_rust_value(&mut m, var, None);
-            hash_rust_value(&mut m, val, basedirs);
+            // env-dep values are hashed verbatim on purpose: a variable that
+            // rustc actually tracked (env!/option_env!/include! path lookups)
+            // may be baked into the artifact, so normalizing it here could make
+            // an artifact embedding another build root's value hit.
+            hash_rust_value(&mut m, val, None);
         }
         let mut env_vars: Vec<_> = env_vars
             .iter()

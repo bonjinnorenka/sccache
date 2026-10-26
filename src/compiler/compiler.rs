@@ -36,7 +36,8 @@ use crate::lru_disk_cache;
 use crate::mock_command::{CommandChild, CommandCreatorSync, RunCommand, exit_status};
 use crate::server;
 use crate::util::{
-    Digest, fmt_duration_as_secs, resolve_compiler_avoiding_wrapper, run_input_output,
+    Digest, depinfo_has_marker, depinfo_mark_basedir, depinfo_resolve_basedir,
+    fmt_duration_as_secs, resolve_compiler_avoiding_wrapper, run_input_output,
 };
 use crate::{counted_array, dist};
 use async_trait::async_trait;
@@ -653,8 +654,39 @@ where
                 };
 
                 let hit = CompileResult::CacheHit(duration);
-                match entry.extract_objects(filtered_outputs, &pool).await {
-                    Ok(()) => Ok(CacheLookupResult::Success(hit, output)),
+                match entry.extract_objects(filtered_outputs.clone(), &pool).await {
+                    Ok(()) => {
+                        // Dep-info restored verbatim names the storing build
+                        // root. Stored files carry basedir markers, so map them
+                        // back onto this request's build root when unambiguous.
+                        let basedirs = storage.basedirs();
+                        let mut depinfo_ok = true;
+                        for fobj in &filtered_outputs {
+                            if !fobj.key.ends_with(".d") {
+                                continue;
+                            }
+                            let Ok(raw) = fs::read(&fobj.path) else {
+                                continue;
+                            };
+                            if !depinfo_has_marker(&raw) {
+                                continue;
+                            }
+                            if basedirs.len() != 1 {
+                                depinfo_ok = false;
+                                break;
+                            }
+                            fs::write(&fobj.path, depinfo_resolve_basedir(&raw, &basedirs[0]))?;
+                        }
+                        if depinfo_ok {
+                            Ok(CacheLookupResult::Success(hit, output))
+                        } else {
+                            debug!(
+                                "[{}]: dep-info markers without a single basedir, treating as miss",
+                                out_pretty
+                            );
+                            Ok(CacheLookupResult::Miss(MissType::Normal))
+                        }
+                    }
                     Err(e) => {
                         if e.downcast_ref::<DecompressionFailure>().is_some() {
                             debug!("[{}]: Failed to decompress object", out_pretty);
@@ -791,9 +823,39 @@ where
                     fmt_duration_as_secs(&duration_compilation)
                 );
                 let start_create_artifact = Instant::now();
+                // Store dep-info with the request's basedir replaced by a
+                // marker so a hit on another build root can be mapped back
+                // onto that root instead of leaking this root's paths.
+                let basedirs = storage.basedirs();
+                let mut dep_info_tmp = None;
+                let mut outputs = outputs;
+                if basedirs.len() == 1 {
+                    for fobj in &mut outputs {
+                        if !fobj.key.ends_with(".d") {
+                            continue;
+                        }
+                        let Ok(raw) = fs::read(&fobj.path) else {
+                            continue;
+                        };
+                        let marked = depinfo_mark_basedir(&raw, &basedirs[0]);
+                        if marked == raw {
+                            continue;
+                        }
+                        let mut tmp = tempfile::NamedTempFile::new_in(
+                            fobj.path.parent().unwrap_or_else(|| std::path::Path::new("/tmp")),
+                        )?;
+                        tmp.write_all(&marked)?;
+                        let (_, tmp_path) = tmp.keep()?;
+                        fobj.path = tmp_path.clone();
+                        dep_info_tmp = Some(tmp_path);
+                    }
+                }
                 let mut entry = CacheWrite::from_objects(outputs, &pool)
                     .await
                     .context("failed to zip up compiler outputs")?;
+                if let Some(tmp_path) = dep_info_tmp {
+                    let _ = fs::remove_file(tmp_path);
+                }
 
                 entry.put_stdout(&compiler_result.stdout)?;
                 entry.put_stderr(&compiler_result.stderr)?;

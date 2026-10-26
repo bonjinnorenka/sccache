@@ -1694,6 +1694,70 @@ pub fn resolve_compiler_avoiding_wrapper(
     executable.to_path_buf()
 }
 
+/// Byte used as a basedir placeholder inside cached dep-info files.
+/// It can never appear in a real dep-info, since makefile paths may not
+/// contain control characters.
+const DEPINFO_BASEDIR_MARK: u8 = 0x01;
+
+/// Escape `p` the way make depfiles spell path characters that would
+/// otherwise break parsing (' ', '#', '\\', '$').
+fn depinfo_escape(p: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(p.len() + 8);
+    for &b in p {
+        if matches!(b, b' ' | b'#' | b'\\' | b'$') {
+            out.push(b'\\');
+        }
+        out.push(b);
+    }
+    out
+}
+
+/// Replace every occurrence of `basedir` in `content` (raw and make-escaped
+/// spellings) with the basedir marker byte. Basedirs always end in '/', so the
+/// marker directly precedes the remainder of the path.
+pub fn depinfo_mark_basedir(content: &[u8], basedir: &[u8]) -> Vec<u8> {
+    let escaped = depinfo_escape(basedir);
+    let mut out = Vec::with_capacity(content.len());
+    let mut i = 0;
+    while i < content.len() {
+        if content[i..].starts_with(basedir)
+            || (escaped != basedir && content[i..].starts_with(&escaped))
+        {
+            out.push(DEPINFO_BASEDIR_MARK);
+            let n = if content[i..].starts_with(basedir) {
+                basedir.len()
+            } else {
+                escaped.len()
+            };
+            i += n;
+        } else {
+            out.push(content[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// True when `content` carries basedir markers from a storing compile.
+pub fn depinfo_has_marker(content: &[u8]) -> bool {
+    content.contains(&DEPINFO_BASEDIR_MARK)
+}
+
+/// Replace basedir markers in `content` with `basedir`. The caller must only
+/// use this when the request has exactly one basedir; otherwise the marker's
+/// origin is ambiguous.
+pub fn depinfo_resolve_basedir(content: &[u8], basedir: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(content.len() + 64);
+    for &b in content {
+        if b == DEPINFO_BASEDIR_MARK {
+            out.extend_from_slice(basedir);
+        } else {
+            out.push(b);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Digest, OsStrExt, TimeMacroFinder, resolve_compiler_avoiding_wrapper};
