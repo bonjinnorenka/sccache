@@ -329,6 +329,7 @@ def cmd_sanitize_log(args: argparse.Namespace) -> int:
     secret_env_vars = (
         "ACTIONS_RUNTIME_TOKEN",
         "ACTIONS_RESULTS_URL",
+        "ACTIONS_CACHE_URL",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
         "GITHUB_TOKEN",

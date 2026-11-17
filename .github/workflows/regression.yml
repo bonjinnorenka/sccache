@@ -2,8 +2,18 @@ name: regression
 
 on:
   push:
+    branches:
+      - main
+      - exp-d-hardening
   pull_request:
+  schedule:
+    # Weekly Monday 03:17 UTC to catch upstream Rust/Cargo toolchain changes cleanly.
+    - cron: "17 3 * * 1"
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -82,12 +92,12 @@ jobs:
                   "",
                   "| Field | Value |",
                   "|---|---|",
-                  "| Commit SHA | \`$COMMIT_SHA\` |",
-                  "| sccache | \`$SCCACHE_VER\` |",
-                  "| rustc | \`$RUSTC_VER\` |",
-                  "| cargo | \`$CARGO_VER\` |",
-                  "| Unit tests (\`--lib\`) | PASS ({:.2}s) |".format($lib_sec),
-                  "| Correctness suite (\`rust_correctness\`) | PASS ({:.2}s) |".format($corr_sec),
+                  "| Commit SHA | `$COMMIT_SHA` |",
+                  "| sccache | `$SCCACHE_VER` |",
+                  "| rustc | `$RUSTC_VER` |",
+                  "| cargo | `$CARGO_VER` |",
+                  "| Unit tests (`--lib`) | PASS ({:.2}s) |".format($lib_sec),
+                  "| Correctness suite (`rust_correctness`) | PASS ({:.2}s) |".format($corr_sec),
                   "",
               ]
               with open(summary_path, "a", encoding="utf-8") as fh:
@@ -168,5 +178,307 @@ jobs:
         with:
           name: sccache-s3-regression-report
           path: target/regression-reports/s3/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  build-sccache-for-regression:
+    name: build-sccache-for-regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+
+      - name: Build sccache binary once for downstream suites
+        run: cargo build --locked --bin sccache
+
+      - name: Upload pre-built sccache binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: sccache-prebuilt-linux
+          path: target/debug/sccache
+          retention-days: 5
+
+  ghac-seed:
+    name: ghac-seed
+    needs: [build-sccache-for-regression]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+
+      - name: Download pre-built sccache binary
+        uses: actions/download-artifact@v8
+        with:
+          name: sccache-prebuilt-linux
+          path: target/debug/
+
+      - name: Export GHAC runtime environment
+        uses: actions/github-script@v8
+        with:
+          script: |
+            for (const key of ['ACTIONS_RESULTS_URL', 'ACTIONS_CACHE_URL', 'ACTIONS_RUNTIME_TOKEN']) {
+              if (process.env[key]) {
+                core.exportVariable(key, process.env[key]);
+              }
+            }
+            const v2 = process.env.ACTIONS_CACHE_SERVICE_V2 || (process.env.ACTIONS_RESULTS_URL ? 'true' : '');
+            if (v2) {
+              core.exportVariable('ACTIONS_CACHE_SERVICE_V2', v2);
+            }
+
+      - name: Seed GHAC cache from Job A (slot-a)
+        env:
+          SCCACHE_BIN: ${{ github.workspace }}/target/debug/sccache
+          SCCACHE_GHA_ENABLED: "on"
+          SCCACHE_GHA_VERSION: reg-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          REPORT_DIR: ${{ github.workspace }}/target/regression-reports/ghac-seed
+        run: |
+          chmod +x "$SCCACHE_BIN"
+          bash tests/integration/scripts/test-ghac-regression.sh \
+            --role seed \
+            --meta-file "$REPORT_DIR/seed-meta.json"
+
+      - name: Upload GHAC seed metadata and sanitized report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sccache-ghac-seed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/regression-reports/ghac-seed/
+          retention-days: 5
+          if-no-files-found: ignore
+
+  sccache-ghac-regression:
+    name: sccache-ghac-regression
+    needs: [build-sccache-for-regression, ghac-seed]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+
+      - name: Download pre-built sccache binary
+        uses: actions/download-artifact@v8
+        with:
+          name: sccache-prebuilt-linux
+          path: target/debug/
+
+      - name: Download GHAC seed metadata (never L0 or target)
+        uses: actions/download-artifact@v8
+        with:
+          name: sccache-ghac-seed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/regression-reports/ghac-seed/
+
+      - name: Export GHAC runtime environment
+        uses: actions/github-script@v8
+        with:
+          script: |
+            for (const key of ['ACTIONS_RESULTS_URL', 'ACTIONS_CACHE_URL', 'ACTIONS_RUNTIME_TOKEN']) {
+              if (process.env[key]) {
+                core.exportVariable(key, process.env[key]);
+              }
+            }
+            const v2 = process.env.ACTIONS_CACHE_SERVICE_V2 || (process.env.ACTIONS_RESULTS_URL ? 'true' : '');
+            if (v2) {
+              core.exportVariable('ACTIONS_CACHE_SERVICE_V2', v2);
+            }
+
+      - name: Verify cross-job cross-root GHAC reuse & L0 backfill (Job B, slot-b)
+        env:
+          SCCACHE_BIN: ${{ github.workspace }}/target/debug/sccache
+          SCCACHE_GHA_ENABLED: "on"
+          SCCACHE_GHA_VERSION: reg-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          REPORT_DIR: ${{ github.workspace }}/target/regression-reports/ghac
+        run: |
+          mkdir -p "$REPORT_DIR"
+          chmod +x "$SCCACHE_BIN"
+          cp target/regression-reports/ghac-seed/leg_ghac_seed.json "$REPORT_DIR/" 2>/dev/null || true
+          bash tests/integration/scripts/test-ghac-regression.sh \
+            --role verify \
+            --meta-file target/regression-reports/ghac-seed/seed-meta.json
+
+      - name: Upload GHAC regression report and sanitized logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sccache-ghac-regression-report
+          path: target/regression-reports/ghac/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  rust-compatibility-matrix:
+    name: rust-compat-${{ matrix.toolchain }}
+    needs: [build-sccache-for-regression]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolchain: stable
+            alt: "1.91.0"
+          - toolchain: beta
+            alt: stable
+          - toolchain: "1.91.0"
+            alt: stable
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v5
+
+      - name: Install target Rust toolchain (${{ matrix.toolchain }})
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Install alternate Rust toolchain (${{ matrix.alt }}) for compiler isolation check
+        run: rustup toolchain install --profile minimal --no-self-update "${{ matrix.alt }}"
+
+      - name: Download pre-built sccache binary
+        uses: actions/download-artifact@v8
+        with:
+          name: sccache-prebuilt-linux
+          path: target/debug/
+
+      - name: Run compatibility regression against ${{ matrix.toolchain }}
+        env:
+          SCCACHE_BIN: ${{ github.workspace }}/target/debug/sccache
+          REPORT_DIR: ${{ github.workspace }}/target/regression-reports/compat-${{ matrix.toolchain }}
+        run: |
+          chmod +x "$SCCACHE_BIN"
+          bash tests/integration/scripts/test-rust-compatibility.sh \
+            --toolchain "${{ matrix.toolchain }}" \
+            --alt-toolchain "${{ matrix.alt }}"
+
+      - name: Upload compatibility report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sccache-rust-compat-${{ matrix.toolchain }}-report
+          path: target/regression-reports/compat-${{ matrix.toolchain }}/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  rust-compatibility-nightly:
+    name: sccache-rust-compatibility-nightly
+    needs: [build-sccache-for-regression]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust nightly
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: nightly
+
+      - name: Install Rust stable for compiler isolation check
+        run: rustup toolchain install --profile minimal --no-self-update stable
+
+      - name: Download pre-built sccache binary
+        uses: actions/download-artifact@v8
+        with:
+          name: sccache-prebuilt-linux
+          path: target/debug/
+
+      - name: Run non-blocking compatibility check against nightly
+        env:
+          SCCACHE_BIN: ${{ github.workspace }}/target/debug/sccache
+          REPORT_DIR: ${{ github.workspace }}/target/regression-reports/compat-nightly
+        run: |
+          chmod +x "$SCCACHE_BIN"
+          bash tests/integration/scripts/test-rust-compatibility.sh \
+            --toolchain nightly \
+            --alt-toolchain stable
+
+      - name: Upload nightly compatibility report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sccache-rust-compat-nightly-report
+          path: target/regression-reports/compat-nightly/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  sccache-rust-compatibility:
+    name: sccache-rust-compatibility
+    needs: [rust-compatibility-matrix, rust-compatibility-nightly]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Summarize and enforce blocking Rust compatibility checks
+        env:
+          MATRIX_RESULT: ${{ needs.rust-compatibility-matrix.result }}
+          NIGHTLY_RESULT: ${{ needs.rust-compatibility-nightly.result }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## sccache Rust Compatibility Matrix"
+            echo ""
+            echo "| Suite | Result | Blocking |"
+            echo "|---|---|---|"
+            echo "| \`stable\`, \`beta\`, \`1.91.0\` | \`${MATRIX_RESULT}\` | Yes |"
+            echo "| \`nightly\` (\`sccache-rust-compatibility-nightly\`) | \`${NIGHTLY_RESULT}\` | No |"
+            echo ""
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+          [ "$MATRIX_RESULT" = "success" ] || {
+            echo "ERROR: blocking Rust compatibility matrix failed ($MATRIX_RESULT)" >&2
+            exit 1
+          }
+
+  sccache-performance:
+    name: sccache-performance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+
+      - name: Build sccache binary
+        run: cargo build --locked --bin sccache
+
+      - name: Run tokio-small and tokio-medium performance regression
+        env:
+          SCCACHE_BIN: ${{ github.workspace }}/target/debug/sccache
+          REPORT_DIR: ${{ github.workspace }}/target/regression-reports/performance
+        run: bash tests/integration/scripts/test-performance-regression.sh
+
+      - name: Upload performance report and sanitized logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sccache-performance-report
+          path: target/regression-reports/performance/
           retention-days: 14
           if-no-files-found: ignore
