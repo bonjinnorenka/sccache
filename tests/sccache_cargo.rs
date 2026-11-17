@@ -408,22 +408,27 @@ fn assert_dep_info_rewritten(
     forbidden_root: &Path,
     expected_root: &Path,
 ) -> Result<()> {
-    let deps_dir = target_dir.join("debug").join("deps");
+    let debug_dir = target_dir.join("debug");
     let mut found = Vec::new();
-    for entry in fs::read_dir(&deps_dir)? {
-        let path = entry?.path();
+    for entry in walkdir::WalkDir::new(&debug_dir) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "d")
             && path
                 .file_name()
                 .is_some_and(|name| name.to_string_lossy().starts_with(crate_prefix))
         {
-            found.push(path);
+            found.push(path.to_path_buf());
         }
     }
+    found.sort();
     anyhow::ensure!(
         !found.is_empty(),
         "no dep-info files found for {crate_prefix} in {}",
-        deps_dir.display()
+        debug_dir.display()
     );
     let forbidden = forbidden_root.to_str().unwrap();
     let expected = expected_root.to_str().unwrap();

@@ -11,6 +11,7 @@ use fs_err as fs;
 use helpers::{CARGO, SCCACHE_BIN, SccacheTest, stop_sccache};
 use serde_json::Value;
 use serial_test::serial;
+#[cfg(unix)]
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
@@ -203,27 +204,39 @@ fn clean_dir_if_exists(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn collect_dep_info_files(target_dir: &Path, crate_prefix: &str) -> Result<Vec<PathBuf>> {
-    let deps_dir = target_dir.join("debug").join("deps");
+fn collect_debug_files_with_ext(
+    target_dir: &Path,
+    file_prefix: &str,
+    ext: &str,
+) -> Result<Vec<PathBuf>> {
+    let debug_dir = target_dir.join("debug");
     let mut files = Vec::new();
-    for entry in fs::read_dir(&deps_dir)? {
-        let path = entry?.path();
-        if path.extension().is_some_and(|e| e == "d")
+    for entry in walkdir::WalkDir::new(&debug_dir) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == ext)
             && path
                 .file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with(crate_prefix))
+                .is_some_and(|n| n.to_string_lossy().starts_with(file_prefix))
         {
-            files.push(path);
+            files.push(path.to_path_buf());
         }
     }
     files.sort();
     ensure!(
         !files.is_empty(),
-        "no dep-info files matching {crate_prefix} in {}",
-        deps_dir.display()
+        "no .{ext} files matching {file_prefix} in {}",
+        debug_dir.display()
     );
     Ok(files)
+}
+
+#[cfg(unix)]
+fn collect_dep_info_files(target_dir: &Path, crate_prefix: &str) -> Result<Vec<PathBuf>> {
+    collect_debug_files_with_ext(target_dir, crate_prefix, "d")
 }
 
 #[cfg(unix)]
@@ -855,12 +868,21 @@ fn test_proc_macro_and_remap_path_prefix_cross_root() -> Result<()> {
 
     let write_ws = |slot: &Path, macro_val: u32| -> Result<()> {
         let proj = slot.join("project");
+        fs::create_dir_all(proj.join("remap_lib/src"))?;
         fs::create_dir_all(proj.join("pm_gen/src"))?;
         fs::create_dir_all(proj.join("pm_consumer/src"))?;
         fs::create_dir_all(proj.join("pm_bin/src"))?;
         fs::write(
             proj.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"pm_gen\", \"pm_consumer\", \"pm_bin\"]\nresolver = \"2\"\n",
+            "[workspace]\nmembers = [\"remap_lib\", \"pm_gen\", \"pm_consumer\", \"pm_bin\"]\nresolver = \"2\"\n",
+        )?;
+        fs::write(
+            proj.join("remap_lib/Cargo.toml"),
+            "[package]\nname = \"remap_lib\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )?;
+        fs::write(
+            proj.join("remap_lib/src/lib.rs"),
+            "pub fn remapped_loc() -> &'static str { std::panic::Location::caller().file() }\n",
         )?;
         fs::write(
             proj.join("pm_gen/Cargo.toml"),
@@ -882,11 +904,11 @@ fn test_proc_macro_and_remap_path_prefix_cross_root() -> Result<()> {
         )?;
         fs::write(
             proj.join("pm_bin/Cargo.toml"),
-            "[package]\nname = \"pm_bin\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\npm_consumer = { path = \"../pm_consumer\" }\n",
+            "[package]\nname = \"pm_bin\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nremap_lib = { path = \"../remap_lib\" }\npm_consumer = { path = \"../pm_consumer\" }\n",
         )?;
         fs::write(
             proj.join("pm_bin/src/main.rs"),
-            "fn main() { println!(\"{}|{}\", pm_consumer::val(), pm_consumer::loc()); }\n",
+            "fn main() { println!(\"{}|{}|{}\", pm_consumer::val(), pm_consumer::loc(), remap_lib::remapped_loc()); }\n",
         )?;
         Ok(())
     };
@@ -915,11 +937,36 @@ fn test_proc_macro_and_remap_path_prefix_cross_root() -> Result<()> {
     let sa = read_stats(&test_info)?;
     assert_eq!(sa.rust_hits, 0);
     assert_eq!(
-        sa.rust_misses, 1,
-        "only pm_consumer rlib should be cacheable"
+        sa.rust_misses, 2,
+        "remap_lib and pm_consumer rlibs should be cacheable"
     );
 
-    // 2. Build slot_b with corresponding remap + basedirs: pm_consumer must HIT!
+    // 2a. Build remap_lib first in slot_b: must HIT across roots on every OS.
+    zero_stats()?;
+    build_cargo_command(
+        &test_info,
+        &proj_b,
+        &proj_b.join("target"),
+        Some(slot_b.as_os_str()),
+        false,
+        &[("RUSTFLAGS", Some(&remap_b))],
+        true,
+    )
+    .args(["-p", "remap_lib"])
+    .assert()
+    .try_success()?;
+    let sb_remap = read_stats(&test_info)?;
+    assert_eq!(
+        sb_remap.rust_hits, 1,
+        "remap_lib should hit across roots when source/remap/basedirs match"
+    );
+    assert_eq!(sb_remap.rust_misses, 0);
+
+    // 2b. Finish building slot_b (pm_gen + pm_consumer + pm_bin).
+    // On ELF Unix targets, pm_gen.so is reproducible across roots so pm_consumer also hits.
+    // On macOS (Mach-O LC_UUID / N_OSO) and Windows MSVC (COFF timestamp / CodeView PDB GUID/path),
+    // uncached pm_gen dynamic libraries legitimately differ by linker metadata, so sccache must not
+    // false-hit when `--extern pm_gen=...` bytes change.
     zero_stats()?;
     run_cargo_build(
         &test_info,
@@ -930,24 +977,36 @@ fn test_proc_macro_and_remap_path_prefix_cross_root() -> Result<()> {
         &[("RUSTFLAGS", Some(&remap_b))],
         true,
     )?;
-    let sb = read_stats(&test_info)?;
-    assert_eq!(
-        sb.rust_hits, 1,
-        "pm_consumer should hit across roots when source/remap/basedirs match"
-    );
-    assert_eq!(sb.rust_misses, 0);
+    let sb_pm = read_stats(&test_info)?;
+    if cfg!(all(unix, not(target_os = "macos"))) {
+        assert_eq!(
+            sb_pm.rust_hits, 1,
+            "pm_consumer should hit across roots on ELF when source/remap/basedirs match"
+        );
+        assert_eq!(sb_pm.rust_misses, 0);
+    } else {
+        assert_eq!(sb_pm.rust_hits + sb_pm.rust_misses, 1);
+    }
 
-    // Ensure slot_b's rlib does not contain raw slot_a path bytes.
-    let rlib_b = proj_b.join("target/debug/libpm_consumer.rlib");
-    let rlib_bytes = fs::read(&rlib_b)?;
+    // Ensure slot_b's rlibs do not contain raw slot_a path bytes.
     let slot_a_bytes = slot_a.to_string_lossy().as_bytes().to_vec();
-    ensure!(
-        !rlib_bytes
-            .windows(slot_a_bytes.len())
-            .any(|w| w == slot_a_bytes.as_slice()),
-        "slot_a path leaked into {}",
-        rlib_b.display()
-    );
+    for rlib_b in collect_debug_files_with_ext(&proj_b.join("target"), "libremap_lib", "rlib")?
+        .into_iter()
+        .chain(collect_debug_files_with_ext(
+            &proj_b.join("target"),
+            "libpm_consumer",
+            "rlib",
+        )?)
+    {
+        let rlib_bytes = fs::read(&rlib_b)?;
+        ensure!(
+            !rlib_bytes
+                .windows(slot_a_bytes.len())
+                .any(|w| w == slot_a_bytes.as_slice()),
+            "slot_a path leaked into {}",
+            rlib_b.display()
+        );
+    }
 
     let out_b = run_cargo_run_stdout(
         &test_info,
@@ -959,7 +1018,7 @@ fn test_proc_macro_and_remap_path_prefix_cross_root() -> Result<()> {
     )?;
     assert!(out_b.starts_with("42|"), "unexpected output: {out_b}");
 
-    // 3. Changing RUSTFLAGS remap replacement target must cause a cache miss.
+    // 3. Changing RUSTFLAGS remap replacement target must cause a cache miss for both rlibs.
     let remap_b_other = format!(
         "--remap-path-prefix={}=/other_src -C opt-level=1",
         slot_b.display()
@@ -977,10 +1036,13 @@ fn test_proc_macro_and_remap_path_prefix_cross_root() -> Result<()> {
     )?;
     let s_flags = read_stats(&test_info)?;
     assert_eq!(s_flags.rust_hits, 0);
-    assert_eq!(s_flags.rust_misses, 1);
+    assert_eq!(s_flags.rust_misses, 2);
 
-    // 4. Changing proc-macro output must invalidate pm_consumer.
-    write_ws(&slot_b, 99)?;
+    // 4. Changing proc-macro output must invalidate pm_consumer while remap_lib stays unaffected.
+    fs::write(
+        proj_b.join("pm_gen/src/lib.rs"),
+        "use proc_macro::TokenStream;\n#[proc_macro]\npub fn make_value(_: TokenStream) -> TokenStream {\n    \"99_u32\".parse().unwrap()\n}\n",
+    )?;
     zero_stats()?;
     run_cargo_build(
         &test_info,
@@ -988,7 +1050,7 @@ fn test_proc_macro_and_remap_path_prefix_cross_root() -> Result<()> {
         &proj_b.join("target"),
         Some(slot_b.as_os_str()),
         false,
-        &[("RUSTFLAGS", Some(&remap_b))],
+        &[("RUSTFLAGS", Some(&remap_b_other))],
         true,
     )?;
     let s_pm = read_stats(&test_info)?;
@@ -999,7 +1061,7 @@ fn test_proc_macro_and_remap_path_prefix_cross_root() -> Result<()> {
         &proj_b,
         &proj_b.join("target"),
         Some(slot_b.as_os_str()),
-        &[("RUSTFLAGS", Some(&remap_b))],
+        &[("RUSTFLAGS", Some(&remap_b_other))],
         true,
     )?;
     assert!(out_b2.starts_with("99|"), "unexpected output: {out_b2}");
@@ -1279,8 +1341,10 @@ fn test_dep_info_fail_closed_on_corrupted_or_ambiguous_cache_entry() -> Result<(
         &[&slot_a],
         &slot_b,
     )?;
+    let failclosed_rlibs =
+        collect_debug_files_with_ext(&proj_b.join("target"), "libfailclosed_lib", "rlib")?;
     ensure!(
-        proj_b.join("target/debug/libfailclosed_lib.rlib").is_file(),
+        failclosed_rlibs.iter().any(|p| p.is_file()),
         "local compile fallback must produce valid rlib"
     );
 

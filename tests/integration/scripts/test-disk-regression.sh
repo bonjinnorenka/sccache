@@ -161,11 +161,11 @@ ACTUAL_MANIFEST="${OUT_B#*|}"
     exit 1
 }
 
-python3 - "$SLOT_A" "$SLOT_B" "$SLOT_B/project/target/debug/deps" <<'PY'
+python3 - "$SLOT_A" "$SLOT_B" "$SLOT_B/project/target/debug" <<'PY'
 import pathlib, sys
-slot_a, slot_b, deps_dir = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
-d_files = sorted(deps_dir.glob("safe_dep-*.d"))
-assert d_files, f"no safe_dep .d files in {deps_dir}"
+slot_a, slot_b, debug_dir = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
+d_files = sorted(debug_dir.rglob("safe_dep*.d"))
+assert d_files, f"no safe_dep .d files in {debug_dir}"
 for p in d_files:
     raw = p.read_bytes()
     assert b"\x01" not in raw and b"\x02" not in raw, f"raw marker left in {p}"
