@@ -9,7 +9,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SUITE="${1:-pr1}"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/sccache-mutation-XXXXXX")"
+SILO_COMPOSE="$REPO_ROOT/tests/integration/docker-compose.yml"
+SILO_STARTED=0
 cleanup() {
+    if [ "$SILO_STARTED" -eq 1 ]; then
+        docker compose -f "$SILO_COMPOSE" --profile s3 down -v >/dev/null 2>&1 || true
+    fi
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -33,7 +38,12 @@ restore_files() {
     cd "$WORK/repo"
     export CARGO_INCREMENTAL=0
     unset RUSTC_WRAPPER || true
-    cargo test --locked --no-run --test rust_correctness >/dev/null
+    if [ "$SUITE" = "pr1" ] || [ "$SUITE" = "all" ]; then
+        cargo test --locked --no-run --test rust_correctness >/dev/null
+    fi
+    if [ "$SUITE" = "pr2" ] || [ "$SUITE" = "pr3" ] || [ "$SUITE" = "all" ]; then
+        cargo build --locked --bin sccache >/dev/null
+    fi
 )
 
 run_mutation() {
@@ -41,6 +51,7 @@ run_mutation() {
     local desc="$2"
     local patch_py="$3"
     local test_cmd="$4"
+    local expected_marker="${5:-Running tests/}"
 
     echo ""
     echo "============================================================"
@@ -71,8 +82,8 @@ PY
         echo "FAIL: Mutation [$id] ($desc) PASSED unexpectedly — regression test did not catch the bug!"
         tail -40 "$WORK/mut_${id}.log"
         exit 1
-    elif ! grep -q "Running tests/" "$WORK/mut_${id}.log"; then
-        echo "FAIL: Mutation [$id] ($desc) failed to compile/run test binary (not a caught test assertion)!"
+    elif ! grep -q "$expected_marker" "$WORK/mut_${id}.log"; then
+        echo "FAIL: Mutation [$id] ($desc) failed before reaching test assertions (marker '$expected_marker' missing)!"
         tail -40 "$WORK/mut_${id}.log"
         exit 1
     else
@@ -147,6 +158,51 @@ assert old in txt
 p.write_text(txt.replace(old, "if false && !depinfo_ok {", 1))
 ' \
         "cargo test --locked --test rust_correctness test_dep_info_fail_closed_on_corrupted_or_ambiguous_cache_entry"
+fi
+
+if [ "$SUITE" = "pr2" ] || [ "$SUITE" = "all" ]; then
+    echo "Starting Silo S3 container for PR2 mutation tests..."
+    docker compose -f "$SILO_COMPOSE" --profile s3 down -v >/dev/null 2>&1 || true
+    docker compose -f "$SILO_COMPOSE" --profile s3 up -d silo silo-setup >/dev/null
+    SILO_STARTED=1
+    attempts=0
+    until curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; do
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge 30 ]; then
+            echo "ERROR: Silo did not become healthy for PR2 mutation suite" >&2
+            exit 1
+        fi
+        sleep 1
+    done
+    docker wait "$(docker compose -f "$SILO_COMPOSE" ps -a -q silo-setup)" >/dev/null 2>&1 || true
+
+    run_mutation "M4_disable_l0_hit" \
+        "Disable Disk L0 cache reads in src/cache/disk.rs" \
+        '
+p = root / "src/cache/disk.rs"
+txt = p.read_text()
+old_get = "trace!(\"DiskCache::get({})\", key);"
+old_raw = "trace!(\"DiskCache::get_raw({})\", key);"
+assert old_get in txt and old_raw in txt
+txt = txt.replace(old_get, "if !key.is_empty() { return Ok(Cache::Miss); }\n        " + old_get, 1)
+txt = txt.replace(old_raw, "if !key.is_empty() { return Ok(None); }\n        " + old_raw, 1)
+p.write_text(txt)
+' \
+        "cargo build --locked --bin sccache && SCCACHE_BIN=\"\$PWD/target/debug/sccache\" SCENARIOS=core SKIP_SILO_SETUP=1 KEEP_SILO=1 REPORT_DIR=\"$WORK/report-m4\" bash tests/integration/scripts/test-s3-multilevel-regression.sh" \
+        "STATS_VERIFY"
+
+    run_mutation "M5_disable_s3_l1_hit" \
+        "Disable S3 L1 reads in RemoteStorage::get_with_raw" \
+        '
+p = root / "src/cache/cache.rs"
+txt = p.read_text()
+old = "async fn get_with_raw(&self, key: &str) -> Result<(Cache, Option<Bytes>)> {\n        match self.operator.read(&normalize_key(key)).await {"
+assert txt.count(old) == 1
+new = "async fn get_with_raw(&self, key: &str) -> Result<(Cache, Option<Bytes>)> {\n        if self.operator.info().scheme() == \"s3\" { return Ok((Cache::Miss, None)); }\n        match self.operator.read(&normalize_key(key)).await {"
+p.write_text(txt.replace(old, new, 1))
+' \
+        "cargo build --locked --bin sccache && SCCACHE_BIN=\"\$PWD/target/debug/sccache\" SCENARIOS=core SKIP_SILO_SETUP=1 KEEP_SILO=1 REPORT_DIR=\"$WORK/report-m5\" bash tests/integration/scripts/test-s3-multilevel-regression.sh" \
+        "STATS_VERIFY"
 fi
 
 echo ""

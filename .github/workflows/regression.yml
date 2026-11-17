@@ -139,3 +139,34 @@ jobs:
           path: target/regression-reports/disk/
           retention-days: 14
           if-no-files-found: ignore
+
+  sccache-s3-regression:
+    name: sccache-s3-regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+
+      - name: Build sccache binary
+        run: cargo build --locked --bin sccache
+
+      - name: Run L0 + S3 (Silo) multilevel regression (S01..S10)
+        env:
+          SCCACHE_BIN: ${{ github.workspace }}/target/debug/sccache
+          REPORT_DIR: ${{ github.workspace }}/target/regression-reports/s3
+        run: bash tests/integration/scripts/test-s3-multilevel-regression.sh
+
+      - name: Upload S3 regression report and failure logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sccache-s3-regression-report
+          path: target/regression-reports/s3/
+          retention-days: 14
+          if-no-files-found: ignore

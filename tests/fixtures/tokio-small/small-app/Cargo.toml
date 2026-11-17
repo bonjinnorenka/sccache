@@ -1,0 +1,9 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "small-app"
+version.workspace = true
+
+[dependencies]
+small-core = { path = "../small-core" }
+small-manifest = { path = "../small-manifest" }
