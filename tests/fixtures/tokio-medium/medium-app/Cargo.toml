@@ -1,0 +1,9 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "medium-app"
+version.workspace = true
+
+[dependencies]
+medium-core = { path = "../medium-core" }
+medium-manifest = { path = "../medium-manifest" }

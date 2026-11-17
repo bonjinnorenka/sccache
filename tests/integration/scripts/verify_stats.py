@@ -156,6 +156,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
             ("rust_misses", args.max_rust_misses, "<="),
             ("rust_misses", args.exact_rust_misses, "=="),
             ("cache_read_errors", args.exact_read_errors, "=="),
+            ("cache_read_errors", args.min_read_errors, ">="),
             ("cache_write_errors", args.exact_write_errors, "=="),
             ("cache_write_errors", args.min_write_errors, ">="),
         ]
@@ -164,6 +165,20 @@ def cmd_verify(args: argparse.Namespace) -> int:
                 actual = parsed[field]
                 if not eval_cmp(actual, op, expected):
                     failures.append(f"{field}: expected {op} {expected}, got {actual}")
+
+        if args.exact_rust_total is not None:
+            rust_total = parsed["rust_hits"] + parsed["rust_misses"]
+            if rust_total != args.exact_rust_total:
+                failures.append(
+                    f"rust_hits + rust_misses: expected == {args.exact_rust_total}, got {rust_total}"
+                )
+
+        if args.min_any_errors is not None:
+            total_errs = parsed["cache_read_errors"] + parsed["cache_write_errors"]
+            if total_errs < args.min_any_errors:
+                failures.append(
+                    f"cache_read_errors + cache_write_errors: expected >= {args.min_any_errors}, got {total_errs}"
+                )
 
         levels = parsed.get("multi_level") or []
         for expr in args.level_check:
@@ -314,6 +329,7 @@ def cmd_sanitize_log(args: argparse.Namespace) -> int:
     secret_env_vars = (
         "ACTIONS_RUNTIME_TOKEN",
         "ACTIONS_RESULTS_URL",
+        "ACTIONS_CACHE_URL",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
         "GITHUB_TOKEN",
@@ -347,9 +363,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify.add_argument("--min-rust-misses", type=int)
     p_verify.add_argument("--max-rust-misses", type=int)
     p_verify.add_argument("--exact-rust-misses", type=int)
+    p_verify.add_argument("--exact-rust-total", type=int)
     p_verify.add_argument("--exact-read-errors", type=int)
+    p_verify.add_argument("--min-read-errors", type=int)
     p_verify.add_argument("--exact-write-errors", type=int)
     p_verify.add_argument("--min-write-errors", type=int)
+    p_verify.add_argument("--min-any-errors", type=int)
     p_verify.add_argument("--level-check", action="append", default=[])
     p_verify.set_defaults(func=cmd_verify)
 

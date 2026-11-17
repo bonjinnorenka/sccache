@@ -261,7 +261,11 @@ dist-server = [
 dist-tests = ["dist-client", "dist-server"]
 
 [workspace]
-exclude = ["tests/test-crate"]
+exclude = [
+  "tests/test-crate",
+  "tests/fixtures/tokio-small",
+  "tests/fixtures/tokio-medium",
+]
 members = ["tests/integration/randomize_readdir"]
 
 [[bench]]

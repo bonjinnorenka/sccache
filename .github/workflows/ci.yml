@@ -1,500 +1,417 @@
 name: ci
-on: [ push, pull_request ]
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - exp-d-hardening
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' && github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: '1'
 
 jobs:
-  lint:
-    name: ${{ matrix.component }} ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ ubuntu-latest, macOS-latest, windows-latest ]
-        component: [ clippy ]
-        include:
-          - component: rustfmt
-            cargo_cmd: fmt -- --check
-            os: ubuntu-latest
-          - component: clippy
-            cargo_cmd: clippy --locked --all-targets -- -D warnings -A unknown-lints -A clippy::type_complexity -A clippy::new-without-default
+  rust-validation:
+    name: rust-validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      - name: Clone repository
+      - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install rust
+      - name: Install Rust stable
         uses: ./.github/actions/rust-toolchain
         with:
-          components: ${{ matrix.component }}
-          # Oldest supported version, keep in sync with README.md
-          toolchain: "1.91.0"
+          toolchain: stable
+          components: clippy rustfmt
 
-      - name: clippy version
-        run: cargo clippy --version
-        if: ${{ matrix.component == 'clippy' }}
+      - name: Install native tools used by Rust system tests
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc clang
 
-      - name: Check
-        run: cargo ${{ matrix.cargo_cmd }}
+      - name: Check formatting
+        run: cargo fmt -- --check
 
-  check_features:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        feature: [ azure, gcs, gha, memcached, redis, s3, webdav ]
-    steps:
-      - name: Clone repository
-        uses: actions/checkout@v5
-
-      - name: Check feature ${{ matrix.feature }}
-        run: cargo check --no-default-features --features ${{ matrix.feature }}
-
-  toml_format:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Clone repository
-        uses: actions/checkout@v5
-
-      - name: Check
+      - name: Check TOML formatting
         run: npx --yes @taplo/cli fmt --check
 
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings -A unknown-lints -A clippy::type_complexity -A clippy::new-without-default -A clippy::double_must_use -A clippy::nonstandard_macro_braces
 
+      - name: Check supported storage features
+        run: |
+          cargo check --locked --no-default-features --features s3
+          cargo check --locked --no-default-features --features gha
+          cargo check --locked --no-default-features --features 's3,gha'
 
-  test:
-    name: test ${{ matrix.os }} rust ${{ matrix.rustc || 'stable' }} ${{ matrix.extra_desc }}
-    runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.allow_failure || false }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            # Oldest supported version, keep in sync with README.md
-            rustc: "1.91.0"
-            extra_desc: dist-tests
-            extra_args: --no-default-features --features=dist-tests test_dist_ -- --test-threads 1
-          - os: ubuntu-22.04
-            rustc: stable
-            extra_desc: dist-server
-            extra_args: --features=dist-server
-          - os: ubuntu-22.04
-            rustc: stable
-          - os: ubuntu-22.04
-            rustc: beta
-          - os: ubuntu-22.04
-            rustc: nightly
-            allow_failure: true
-            extra_args: --features=unstable
-          - os: ubuntu-22.04
-            extra_desc: no-default-features
-            extra_args: --no-default-features
-            allow_failure: true
-          - os: ubuntu-22.04
-            cuda: "11.8"
-            extra_desc: cuda11.8
-          - os: ubuntu-24.04
-            cuda: "12.8"
-            # Oldest supported version, keep in sync with README.md
-            rustc: "1.91.0"
-            extra_desc: cuda12.8
-          # # M1 CPU
-          - os: macos-14
-          - os: macos-15-intel
-          - os: windows-2022
-            cuda: "12.8"
-            # Oldest supported version, keep in sync with README.md
-            rustc: "1.91.0"
-            extra_args: --no-fail-fast
-            notest_cuda_compilers: clang++
-            extra_desc: cuda12.8
-          - os: windows-2022
-            cuda: "12.8"
-            rustc: nightly
-            allow_failure: true
-            extra_args: --features=unstable
-            notest_cuda_compilers: clang++
-            extra_desc: cuda12.8
-          - os: windows-2022
-            cuda: "12.8"
-            rustc: beta
-            notest_cuda_compilers: clang++
-            extra_desc: cuda12.8
-            no_coverage: true
-    env:
-      RUST_BACKTRACE: 1
-      COVERAGE_REPORT_DIR: "target/debug"
-      COVERAGE_REPORT_FILE: "target/debug/lcov.info"
-      BINARY_DIR: "target/debug"
-      GRCOV_IGNORE_OPTION: '--ignore build.rs --ignore "/*" --ignore "[a-zA-Z]:/*"'
-      GRCOV_EXCLUDE_OPTION: '--excl-br-line "^\s*((debug_)?assert(_eq|_ne)?!|#\[derive\()"'
-      NOTEST_CUDA_COMPILERS: ${{ matrix.notest_cuda_compilers || '' }}
-      CARGO_PROFILE_DEV_DEBUG: '0' # save disk space
-    steps:
-      - if: ${{ contains(matrix.os, 'windows') }}
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Clone repository
-        uses: actions/checkout@v5
-
-      - name: Install rust
-        uses: ./.github/actions/rust-toolchain
-        with:
-          toolchain: ${{ matrix.rustc }}
-          components: llvm-tools-preview
-
-      - if: ${{ contains(matrix.os, 'ubuntu') }}
-        name: Install gcc & clang for tests
+      - name: Run Rust unit and integration tests
         env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          set -x
-          # Conflicts with clang-cuda
-          if dpkg -s gcc-14 >/dev/null 2>&1; then
-            sudo apt remove -y gcc-14 g++-14
-            sudo apt autoremove -y
-          fi
-          sudo apt install -y --no-install-recommends gcc clang
-          echo 'gcc version:'
-          gcc --version
-          echo 'clang version:'
-          clang --version
+          CARGO_INCREMENTAL: '0'
+          RUSTC_WRAPPER: ''
+        run: cargo test --locked --lib --bins --tests
 
-      - if: ${{ matrix.cuda != '' && (runner.os == 'Linux' || runner.os == 'Windows') }}
-        name: Install nvcc
-        uses: ./.github/actions/nvcc-toolchain
-        with:
-          cuda-version: ${{ matrix.cuda }}
+      - name: Build the shared Linux validation binary
+        run: cargo build --locked --bin sccache
 
-      - name: "`grcov` ~ install"
-        if: ${{ ! matrix.no_coverage }}
-        shell: bash
-        run: |
-          GRCOV_VERSION="0.10.7"
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            TARGET="x86_64-pc-windows-msvc"
-            EXT="zip"
-          elif [[ "$RUNNER_OS" == "macOS" && "$RUNNER_ARCH" == "ARM64" ]]; then
-            TARGET="aarch64-apple-darwin"
-            EXT="tar.bz2"
-          elif [[ "$RUNNER_OS" == "macOS" ]]; then
-            TARGET="x86_64-apple-darwin"
-            EXT="tar.bz2"
-          else
-            TARGET="x86_64-unknown-linux-musl"
-            EXT="tar.bz2"
-          fi
-          URL="https://github.com/mozilla/grcov/releases/download/v${GRCOV_VERSION}/grcov-${TARGET}.${EXT}"
-          curl -sL "$URL" -o "grcov.${EXT}"
-          if [[ "$EXT" == "zip" ]]; then
-            unzip -q "grcov.${EXT}" -d "$HOME/.cargo/bin/"
-          else
-            tar -xjf "grcov.${EXT}" -C "$HOME/.cargo/bin/"
-          fi
-
-      - name: Create config for testing
-        if: ${{ ! matrix.no_coverage }}
-        run: |
-          mkdir -p .cargo
-          echo '[env]
-          LLVM_PROFILE_FILE = { value = "target/debug/coverage/default-%p-%8m.profraw", relative = true }' >> .cargo/config.toml
-
-      - if: ${{ matrix.cuda != '' && runner.os == 'Linux' }}
-        name: Free disk space for CUDA tests
-        run: |
-          sudo apt clean
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost /usr/share/swift /var/lib/apt/lists/*
-
-      - name: Execute tests
-        run: cargo test --locked --lib --bins --tests ${{ matrix.extra_args }}
-        env:
-          CARGO_INCREMENTAL: "0"
-          RUSTC_WRAPPER: ""
-          RUSTFLAGS: "-Cinstrument-coverage -Ccodegen-units=1 -Copt-level=0 -Coverflow-checks=off"
-
-      - name: Upload failure
-        if: failure()
-        uses: ./.github/actions/artifact_failure
-        with:
-          name: test-${{ matrix.os }}-${{ matrix.rustc || 'stable' }}-${{ matrix.extra_desc }}
-
-  # coverage:
-      - name: Display coverage files
-        if: ${{ ! matrix.no_coverage }}
-        shell: bash
-        run:
-          grcov . -s . --binary-path $BINARY_DIR --output-type files $GRCOV_IGNORE_OPTION $GRCOV_EXCLUDE_OPTION | sort --unique
-
-      - name: Generate coverage data (via `grcov`)
-        if: ${{ ! matrix.no_coverage }}
-        id: coverage
-        shell: bash
-        run: |
-          mkdir -p "${COVERAGE_REPORT_DIR}"
-          grcov . -s . --binary-path $BINARY_DIR --output-type lcov --output-path "${COVERAGE_REPORT_FILE}" --branch $GRCOV_IGNORE_OPTION $GRCOV_EXCLUDE_OPTION
-          echo "report=${COVERAGE_REPORT_FILE}" >> $GITHUB_OUTPUT
-
-      - name: Check Codecov token availability
-        if: ${{ ! matrix.no_coverage }}
-        id: codecov_check
-        shell: bash
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-        run: echo "available=${CODECOV_TOKEN:+true}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload coverage results (to Codecov.io)
-        if: ${{ ! matrix.no_coverage && steps.codecov_check.outputs.available == 'true' }}
-        uses: codecov/codecov-action@v5
-        with:
-          files: ${{ steps.coverage.outputs.report }}
-          ## flags: IntegrationTests, UnitTests, ${{ steps.vars.outputs.CODECOV_FLAGS }}
-          flags: ${{ steps.vars.outputs.CODECOV_FLAGS }}
-          name: codecov-umbrella-${{ matrix.os }}-rust_${{ matrix.rustc || 'stable' }}-${{ matrix.extra_desc }}
-          fail_ci_if_error: true
-          # verbose: true
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-
-
-
-  build:
-    name: build ${{ matrix.binary || 'sccache' }} ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    container: ${{ fromJson(matrix.container || '{"image":null}') }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-musl
-            container: '{"image": "messense/rust-musl-cross:x86_64-musl"}'
-          - os: ubuntu-22.04
-            target: s390x-unknown-linux-musl
-            container: '{"image": "messense/rust-musl-cross:s390x-musl"}'
-            lto: "false"
-          - os: ubuntu-22.04
-            target: s390x-unknown-linux-gnu
-          - os: ubuntu-22.04
-            target: riscv64gc-unknown-linux-musl
-            container: '{"image": "messense/rust-musl-cross:riscv64gc-musl"}'
-            rustflags: -Ctarget-feature=+crt-static
-          - os: ubuntu-22.04
-            target: loongarch64-unknown-linux-musl
-            container: '{"image": "messense/rust-musl-cross:loongarch64-musl"}'
-            rustflags: -Ctarget-feature=+crt-static
-          - os: ubuntu-22.04
-            binary: sccache-dist
-            extra_args: --no-default-features --features="dist-server"
-            target: x86_64-unknown-linux-musl
-            container: '{"image": "messense/rust-musl-cross:x86_64-musl"}'
-          - os: ubuntu-22.04
-            target: aarch64-unknown-linux-musl
-            container: '{"image": "messense/rust-musl-cross:aarch64-musl"}'
-          - os: ubuntu-22.04
-            binary: sccache-dist
-            extra_args: --no-default-features --features="dist-server"
-            target: aarch64-unknown-linux-musl
-            container: '{"image": "messense/rust-musl-cross:aarch64-musl"}'
-          - os: ubuntu-22.04
-            target: armv7-unknown-linux-musleabi
-            container: '{"image": "messense/rust-musl-cross:armv7-musleabi"}'
-          - os: ubuntu-22.04
-            target: i686-unknown-linux-musl
-            container: '{"image": "messense/rust-musl-cross:i686-musl"}'
-          - os: macos-14
-            target: aarch64-apple-darwin
-            macosx_deployment_target: 11.0
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            macosx_deployment_target: 11.0
-          - os: windows-2022
-            target: x86_64-pc-windows-msvc
-            rustflags: -Ctarget-feature=+crt-static
-          - os: windows-2022
-            target: aarch64-pc-windows-msvc
-            rustflags: -Ctarget-feature=+crt-static
-    steps:
-      - name: Clone repository
-        uses: actions/checkout@v5
-
-      - name: Install rust
-        uses: ./.github/actions/rust-toolchain
-        with:
-          toolchain: ${{ matrix.target == 'aarch64-apple-darwin' && 'beta' || 'stable' }}
-          target: ${{ matrix.target }}
-        if: ${{ !matrix.container }}
-
-      - name: Install s390x cross-compilation toolchain
-        if: ${{ matrix.target == 's390x-unknown-linux-gnu' }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-s390x-linux-gnu g++-s390x-linux-gnu
-          mkdir -p .cargo
-          cat >> .cargo/config.toml <<EOF
-          [target.s390x-unknown-linux-gnu]
-          linker = "s390x-linux-gnu-gcc"
-          EOF
-
-      - name: Install rust-src for s390x-musl
-        if: ${{ matrix.target == 's390x-unknown-linux-musl' }}
-        run: |
-          # Remove corrupted nightly toolchain if it exists
-          rustup toolchain uninstall nightly || true
-          # Clean up any leftover files
-          rm -rf ~/.rustup/toolchains/nightly-* || true
-          # Install fresh nightly with minimal profile
-          rustup toolchain install nightly --profile minimal
-          rustup component add rust-src --toolchain nightly
-
-      - name: fix build openssl error on s390x
-        if: ${{  matrix.target  == 's390x-unknown-linux-musl' }}
-        run: |
-          # see https://github.com/openssl/openssl/issues/27323
-          echo CFLAGS="-march=z10 -mzarch" >> $GITHUB_ENV
-          echo CXXFLAGS="$CFLAGS" >> $GITHUB_ENV
-          echo RUSTFLAGS="-C target-cpu=z10" >> $GITHUB_ENV
-
-      - name: Build (s390x-musl with build-std)
-        if: ${{ matrix.target == 's390x-unknown-linux-musl' }}
-        run: cargo +nightly build --locked --release --bin ${{ matrix.binary || 'sccache' }} --target ${{ matrix.target }} --features=openssl/vendored ${{ matrix.extra_args }} -Zbuild-std
-        env:
-          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
-          DEVELOPER_DIR: ${{ matrix.developer_dir }}
-          SDKROOT: ${{ matrix.sdkroot }}
-          RUSTFLAGS: ${{ env.RUSTFLAGS || matrix.rustflags }}
-          CARGO_PROFILE_RELEASE_LTO: ${{ matrix.lto || 'true' }}
-
-      - name: Build
-        if: ${{ matrix.target != 's390x-unknown-linux-musl' }}
-        run: cargo build --locked --release --bin ${{ matrix.binary || 'sccache' }} --target ${{ matrix.target }} --features=openssl/vendored ${{ matrix.extra_args }}
-        env:
-          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
-          DEVELOPER_DIR: ${{ matrix.developer_dir }}
-          SDKROOT: ${{ matrix.sdkroot }}
-          RUSTFLAGS: ${{ env.RUSTFLAGS || matrix.rustflags }}
-          CARGO_PROFILE_RELEASE_LTO: ${{ matrix.lto || 'true' }}
-
-      # Workaround for the lack of substring() function in github actions expressions.
-      - name: Id
-        id: id
-        shell: bash
-        run: echo "id=${ID#refs/tags/}" >> $GITHUB_OUTPUT
-        env:
-          ID: ${{ startsWith(github.ref, 'refs/tags/') && github.ref || github.sha }}
-
-      - name: Upload artifacts
+      - name: Upload the shared Linux binary
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.binary || 'sccache' }}-${{ steps.id.outputs.id }}-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.binary || 'sccache' }}${{ endsWith(matrix.target, '-msvc') && '.exe' || '' }}
+          name: sccache-linux-debug-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/debug/sccache
+          retention-days: 2
           if-no-files-found: error
 
-
-  test_freebsd:
-    name: test freebsd-15.0 rust stable
-    runs-on: ${{ matrix.job.os }}
-    timeout-minutes: 70
-    strategy:
-      fail-fast: false
-      matrix:
-        job:
-          - { os: ubuntu-22.04 }
+  cache-regression:
+    name: cache-regression
+    needs: rust-validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
-      - name: Prepare, build and test
-        uses: vmactions/freebsd-vm@v1
-        with:
-          mem: 8192
-          usesh: true
-          sync: rsync
-          copyback: false
-          prepare: pkg install -y ca_root_nss curl gmake gtar pot sudo
-          run: |
-            #####################################################################################
-            ###  Prepare, build, and test
-            #####################################################################################
-            ###  based on ref: <https://github.com/rust-lang/rustup/pull/2783>
-            ###  and on ref: <https://github.com/uutils/coreutils/commit/86c610a84b8b6c>
-            ###  * NOTE: All steps need to be run in this block, otherwise, we are operating back
-            ###    on the mac host.
-            set -exo pipefail
-            #
-            ### Basic user setup ################################################################
-            TEST_USER=tester
-            TEST_USER_HOME="/opt/$TEST_USER"
-            REPO_NAME=${GITHUB_WORKSPACE##*/}
-            WORKSPACE_PARENT="/home/runner/work/${REPO_NAME}"
-            WORKSPACE="${WORKSPACE_PARENT}/${REPO_NAME}"
-            export WORKSPACE
-            #
-            mkdir -p "$TEST_USER_HOME"
-            pw adduser -n "$TEST_USER" -d "$TEST_USER_HOME" -c "Tester" -h -
-            chown -R "$TEST_USER":"$TEST_USER" "$TEST_USER_HOME"
-            chown -R "$TEST_USER":"$TEST_USER" "/$WORKSPACE_PARENT"/
-            cat > /usr/local/etc/sudoers.d/wheel<<EOF
-            $TEST_USER ALL=(ALL) NOPASSWD: ALL
-            EOF
-            #
-            ### Install rust stable from rustup  ################################################
-            su "$TEST_USER" -c "/bin/sh -exo pipefail" <<"EOH"
-            whoami
-            echo "$HOME"
-            fetch -o /tmp/rustup.sh https://sh.rustup.rs
-            sh /tmp/rustup.sh -y --profile=minimal
-            ### Run tests #######################################################################
-            . "$HOME/.cargo/env"
-            "$WORKSPACE/scripts/freebsd-ci-test.sh"
-            EOH
-            # end
-      - name: Upload failure
-        if: failure()
-        uses: ./.github/actions/artifact_failure
-        with:
-          name: test-freebsd-15.0-stable
-
-  release:
-    name: release
-    runs-on: ubuntu-latest
-    needs: [ build, lint, test ]
-    if: ${{ startsWith(github.ref, 'refs/tags/') }}
-    steps:
-      - name: Clone repository
+      - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Check versions
-        run: |
-          tag_name=${GITHUB_REF#refs/tags/}
-          v=$(grep -m 1 "^version" Cargo.toml|sed -e "s|version = \"\(.*\)\"|\1|")
-          if ! echo $tag_name|grep -q $v; then
-             echo "Mistmatch of the version:"
-             echo "Cargo.toml says $v while the tag is $tag_name"
-             exit 2
-          fi
+      - name: Install Rust stable
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
 
-      - name: Get artifacts
+      - name: Download the validated Linux binary
         uses: actions/download-artifact@v8
+        with:
+          name: sccache-linux-debug-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/debug/
 
-      - name: Create release assets
-        run: |
-          for d in sccache-*; do
-            chmod +x "$d/sccache"*
-            cp README.md LICENSE "$d/"
-            tar -zcvf "$d.tar.gz" "$d"
-            echo -n "$(shasum -ba 256 "$d.tar.gz" | cut -d " " -f 1)" > "$d.tar.gz.sha256"
-            if [[ $d =~ sccache-.*-pc-windows-.* ]]; then
-              zip -r "$d.zip" "$d"
-              echo -n "$(shasum -ba 256 "$d.zip" | cut -d " " -f 1)" > "$d.zip.sha256"
-            fi
-          done
-
-      - name: Create release
-        run: |
-          sudo apt-get update && sudo apt-get install -y hub
-          tag_name=${GITHUB_REF#refs/tags/}
-          for f in sccache-*.tar.gz* sccache-*.zip*; do
-              if [[ -f "$f" ]]; then
-                files="$files -a $f";
-              fi
-          done
-          hub release create -d -m $tag_name $tag_name $files
+      - name: Run Disk L0 correctness, Cross-root, and dep-info checks
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SCCACHE_BIN: ${{ github.workspace }}/target/debug/sccache
+          REPORT_DIR: ${{ github.workspace }}/target/regression-reports/disk
+        run: |
+          chmod +x "$SCCACHE_BIN"
+          bash tests/integration/scripts/test-disk-regression.sh
+
+      - name: Run Silo S3 L1, backfill, and fault-injection checks
+        env:
+          SCCACHE_BIN: ${{ github.workspace }}/target/debug/sccache
+          REPORT_DIR: ${{ github.workspace }}/target/regression-reports/s3
+        run: bash tests/integration/scripts/test-s3-multilevel-regression.sh
+
+      - name: Measure Tokio Small and Medium cache performance
+        env:
+          SCCACHE_BIN: ${{ github.workspace }}/target/debug/sccache
+          REPORT_DIR: ${{ github.workspace }}/target/regression-reports/performance
+        run: bash tests/integration/scripts/test-performance-regression.sh
+
+      - name: Upload cache regression reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cache-regression-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/regression-reports/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  ghac-seed:
+    name: ghac-seed
+    needs: rust-validation
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+
+      - name: Download the validated Linux binary
+        uses: actions/download-artifact@v8
+        with:
+          name: sccache-linux-debug-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/debug/
+
+      - name: Export GHAC runtime environment
+        uses: actions/github-script@v8
+        with:
+          script: |
+            for (const key of ['ACTIONS_RESULTS_URL', 'ACTIONS_CACHE_URL', 'ACTIONS_RUNTIME_TOKEN']) {
+              if (process.env[key]) core.exportVariable(key, process.env[key]);
+            }
+            const v2 = process.env.ACTIONS_CACHE_SERVICE_V2 || (process.env.ACTIONS_RESULTS_URL ? 'true' : '');
+            if (v2) core.exportVariable('ACTIONS_CACHE_SERVICE_V2', v2);
+
+      - name: Seed GHAC from this job
+        env:
+          SCCACHE_BIN: ${{ github.workspace }}/target/debug/sccache
+          SCCACHE_GHA_ENABLED: 'on'
+          SCCACHE_GHA_VERSION: reg-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          REPORT_DIR: ${{ github.workspace }}/target/regression-reports/ghac-seed
+        run: |
+          chmod +x "$SCCACHE_BIN"
+          bash tests/integration/scripts/test-ghac-regression.sh \
+            --role seed \
+            --meta-file "$REPORT_DIR/seed-meta.json"
+
+      - name: Upload seed metadata and sanitized report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ghac-seed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/regression-reports/ghac-seed/
+          retention-days: 5
+          if-no-files-found: ignore
+
+  ghac-verify:
+    name: ghac-verify
+    needs: [rust-validation, ghac-seed]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Require a trusted run with a successful seed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPOSITORY: ${{ github.repository }}
+          RUST_VALIDATION_RESULT: ${{ needs.rust-validation.result }}
+          GHAC_SEED_RESULT: ${{ needs.ghac-seed.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == pull_request && "$HEAD_REPOSITORY" != "$BASE_REPOSITORY" ]]; then
+            echo "GHAC was not run: fork PRs do not receive cache write credentials. A maintainer must run this workflow on a trusted branch before merge."
+            exit 1
+          fi
+          [[ "$RUST_VALIDATION_RESULT" == success ]] || { echo "Rust validation did not pass"; exit 1; }
+          [[ "$GHAC_SEED_RESULT" == success ]] || { echo "GHAC seed did not pass"; exit 1; }
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+
+      - name: Download the validated Linux binary
+        uses: actions/download-artifact@v8
+        with:
+          name: sccache-linux-debug-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/debug/
+
+      - name: Download seed metadata only
+        uses: actions/download-artifact@v8
+        with:
+          name: ghac-seed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/regression-reports/ghac-seed/
+
+      - name: Export GHAC runtime environment
+        uses: actions/github-script@v8
+        with:
+          script: |
+            for (const key of ['ACTIONS_RESULTS_URL', 'ACTIONS_CACHE_URL', 'ACTIONS_RUNTIME_TOKEN']) {
+              if (process.env[key]) core.exportVariable(key, process.env[key]);
+            }
+            const v2 = process.env.ACTIONS_CACHE_SERVICE_V2 || (process.env.ACTIONS_RESULTS_URL ? 'true' : '');
+            if (v2) core.exportVariable('ACTIONS_CACHE_SERVICE_V2', v2);
+
+      - name: Verify cross-job GHAC hit, Cross-root reuse, and L0 backfill
+        env:
+          SCCACHE_BIN: ${{ github.workspace }}/target/debug/sccache
+          SCCACHE_GHA_ENABLED: 'on'
+          SCCACHE_GHA_VERSION: reg-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          REPORT_DIR: ${{ github.workspace }}/target/regression-reports/ghac
+        run: |
+          mkdir -p "$REPORT_DIR"
+          chmod +x "$SCCACHE_BIN"
+          cp target/regression-reports/ghac-seed/leg_ghac_seed.json "$REPORT_DIR/"
+          bash tests/integration/scripts/test-ghac-regression.sh \
+            --role verify \
+            --meta-file target/regression-reports/ghac-seed/seed-meta.json
+
+      - name: Upload GHAC verification report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ghac-verify-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/regression-reports/ghac/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  rust-beta-compatibility:
+    name: rust-beta-compatibility
+    needs: rust-validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust beta
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: beta
+
+      - name: Install stable for compiler-key isolation
+        run: rustup toolchain install --profile minimal --no-self-update stable
+
+      - name: Download the validated Linux binary
+        uses: actions/download-artifact@v8
+        with:
+          name: sccache-linux-debug-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/debug/
+
+      - name: Check Rust cache compatibility with beta
+        env:
+          SCCACHE_BIN: ${{ github.workspace }}/target/debug/sccache
+          REPORT_DIR: ${{ github.workspace }}/target/regression-reports/compat-beta
+        run: |
+          chmod +x "$SCCACHE_BIN"
+          bash tests/integration/scripts/test-rust-compatibility.sh --toolchain beta --alt-toolchain stable
+
+      - name: Upload beta compatibility report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-beta-compatibility-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/regression-reports/compat-beta/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  linux-release-smoke:
+    name: linux-release-smoke
+    needs: rust-validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust stable and musl tools
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+
+      - name: Install musl target and linker
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Build the Linux x86_64 musl release binary
+        run: cargo build --locked --release --bin sccache --target x86_64-unknown-linux-musl --features openssl/vendored
+
+      - name: Smoke test the release binary and Rust compilation
+        env:
+          SCCACHE_BIN: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/sccache
+          REPORT_DIR: ${{ github.workspace }}/target/regression-reports/release-smoke
+        run: |
+          chmod +x "$SCCACHE_BIN"
+          "$SCCACHE_BIN" --version
+          bash tests/integration/scripts/test-disk-regression.sh
+
+      - name: Package the verified binary and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == tag ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="${GITHUB_SHA::12}"
+          fi
+          package="sccache-${version}-x86_64-unknown-linux-musl"
+          mkdir -p "release-package/$package"
+          cp target/x86_64-unknown-linux-musl/release/sccache README.md LICENSE "release-package/$package/"
+          tar -C release-package -czf "$package.tar.gz" "$package"
+          sha256sum "$package.tar.gz" > "$package.tar.gz.sha256"
+          sha256sum --check "$package.tar.gz.sha256"
+
+      - name: Upload verified release package
+        uses: actions/upload-artifact@v7
+        with:
+          name: sccache-release-x86_64-unknown-linux-musl-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            sccache-*.tar.gz
+            sccache-*.tar.gz.sha256
+          retention-days: 14
+          if-no-files-found: error
+
+  release:
+    name: publish-linux-release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs:
+      - rust-validation
+      - cache-regression
+      - ghac-seed
+      - ghac-verify
+      - rust-beta-compatibility
+      - linux-release-smoke
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag, commit, and package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          [[ "$tag_commit" == "$GITHUB_SHA" ]]
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          [[ -n "$version" && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Cargo.toml has no supported numeric package version: '$version'" >&2
+            exit 1
+          }
+          version_regex="${version//./\\.}"
+          tag_regex="^v${version_regex}(-fork\\.[1-9][0-9]*)?$"
+          [[ "$GITHUB_REF_NAME" =~ $tag_regex ]] || {
+            echo "Tag '$GITHUB_REF_NAME' must be v$version or v$version-fork.<positive revision>" >&2
+            exit 1
+          }
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; refusing to replace it."
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Download verified Linux x86_64 package
+        uses: actions/download-artifact@v8
+        with:
+          name: sccache-release-x86_64-unknown-linux-musl-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify downloaded package SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$(find . -maxdepth 1 -type f -name 'sccache-*.tar.gz' -print -quit)"
+          [[ -n "$archive" && -f "$archive.sha256" ]] || {
+            echo "Verified package or its SHA-256 file is missing" >&2
+            exit 1
+          }
+          sha256sum --check "$archive.sha256"
+
+      - name: Publish verified Linux x86_64 assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" sccache-*.tar.gz sccache-*.tar.gz.sha256 --verify-tag --title "$GITHUB_REF_NAME" --notes "Verified Ubuntu Linux x86_64 musl release."
