@@ -10,24 +10,6 @@ on:
       - 'v*'
   schedule:
     - cron: '17 3 * * 1'
-  workflow_dispatch:
-    inputs:
-      rust_toolchain:
-        description: Rust toolchain for the extended compatibility run
-        required: true
-        default: nightly
-        type: string
-      mutation_suite:
-        description: Mutation suite to run in an isolated checkout
-        required: true
-        default: all
-        type: choice
-        options:
-          - all
-          - pr1
-          - pr2
-          - pr3
-          - none
 
 permissions:
   contents: read
@@ -365,44 +347,6 @@ jobs:
             sccache-*.tar.gz.sha256
           retention-days: 14
           if-no-files-found: error
-
-  extended-rust-checks:
-    name: extended-rust-checks
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: rust-validation
-    runs-on: ubuntu-24.04
-    timeout-minutes: 240
-    continue-on-error: ${{ github.event_name == 'schedule' }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install selected Rust toolchain
-        uses: ./.github/actions/rust-toolchain
-        with:
-          toolchain: ${{ github.event_name == 'schedule' && 'nightly' || inputs.rust_toolchain }}
-
-      - name: Install stable for cache-key comparison
-        run: rustup toolchain install --profile minimal --no-self-update stable
-
-      - name: Build the Linux validation binary
-        run: cargo build --locked --bin sccache
-
-      - name: Run extended Rust cache compatibility checks
-        env:
-          SCCACHE_BIN: ${{ github.workspace }}/target/debug/sccache
-          REPORT_DIR: ${{ github.workspace }}/target/regression-reports/compat-extended
-          RUST_TOOLCHAIN: ${{ github.event_name == 'schedule' && 'nightly' || inputs.rust_toolchain }}
-        run: |
-          bash tests/integration/scripts/test-rust-compatibility.sh \
-            --toolchain "$RUST_TOOLCHAIN" \
-            --alt-toolchain stable
-
-      - name: Run selected mutation suite
-        if: github.event_name == 'schedule' || inputs.mutation_suite != 'none'
-        env:
-          MUTATION_SUITE: ${{ github.event_name == 'schedule' && 'all' || inputs.mutation_suite }}
-        run: bash scripts/run-mutation-tests.sh "$MUTATION_SUITE"
 
   release:
     name: publish-linux-release

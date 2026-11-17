@@ -37,10 +37,10 @@ Checks ruleset must include `rust-validation`, `cache-regression`,
 
 ## Extended checks and releases
 
-The weekly run checks Rust nightly and runs all mutation tests. A manual run
-can select a Rust toolchain and one of the PR1/PR2/PR3/all mutation suites, or
-disable mutations. Nightly schedule failures are reported but do not block
-merges. These jobs are not required checks.
+The separate `extended-rust-checks` workflow runs weekly on Rust nightly and
+runs all mutation tests. A manual run can select a Rust toolchain and one of
+the PR1/PR2/PR3/all mutation suites, or disable mutations. Nightly schedule
+failures are reported but do not block merges. These checks are not required.
 
 A `v*` tag must point to the tested commit, and its version must match
 `Cargo.toml`. Only after all required correctness, storage, GHAC, beta, and
