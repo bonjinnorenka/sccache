@@ -356,6 +356,16 @@ embed path-dependent values never false-hit across build roots. Rust dep-info
 (`.d`) is written from the local invocation on both cache hits and misses, so it
 always names the consuming build root.
 
+Rust normalization is fail-closed: `rustc` writes the working directory and
+source paths into debug info and crate metadata, and a cache hit copies those
+bytes verbatim. sccache therefore only normalizes Rust paths when the
+invocation also passes a `--remap-path-prefix` whose source covers `cwd` and the
+source files, and a remap scope that includes `all` (the default). Otherwise the
+raw paths stay in the key and a different build root misses. Compilations that
+consume a procedural macro also always keep raw paths, because a proc macro can
+read `CARGO_MANIFEST_DIR` or `current_dir()` directly and rustc does not record
+those reads in dep-info.
+
 This is similar to ccache's `CCACHE_BASEDIR` and helps when:
 * Building the same project from different directories
 * Sharing cache between CI jobs with different checkout paths
@@ -366,10 +376,11 @@ This is similar to ccache's `CCACHE_BASEDIR` and helps when:
 compiler invocation. A relative config-file value prevents the server from
 starting.
 
-**Rust note:** This setting normalizes cache-key path inputs; it does not rewrite
-paths already embedded in compiled artifacts (use `--remap-path-prefix` for
-debug/metadata paths). Crates whose tracked `rustc` `env-dep` values differ
-across roots (for example `env!("CARGO_MANIFEST_DIR")` or `env!("OUT_DIR")`)
+**Rust note:** This setting only normalizes cache-key path inputs. Cross-root
+Rust reuse additionally requires `--remap-path-prefix=<root>=<stable>` (and a
+scope that includes metadata) so the cached artifact itself no longer names the
+producing root. Crates whose tracked `rustc` `env-dep` values differ across
+roots (for example `env!("CARGO_MANIFEST_DIR")` or `env!("OUT_DIR")`)
 intentionally miss so foreign build-root paths are never served from cache.
 
 You can also configure this in the sccache config file:

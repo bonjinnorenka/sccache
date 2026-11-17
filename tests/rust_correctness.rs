@@ -232,6 +232,78 @@ fn collect_debug_files_with_ext(
     Ok(files)
 }
 
+fn assert_files_lack_path(files: &[PathBuf], forbidden: &Path) -> Result<()> {
+    let needle = forbidden.to_string_lossy().as_bytes().to_vec();
+    for file in files {
+        let bytes = fs::read(file)?;
+        ensure!(
+            !bytes
+                .windows(needle.len())
+                .any(|window| window == needle.as_slice()),
+            "foreign root {} leaked into {}",
+            forbidden.display(),
+            file.display()
+        );
+    }
+    Ok(())
+}
+
+fn assert_files_contain_path(files: &[PathBuf], expected: &Path) -> Result<()> {
+    let needle = expected.to_string_lossy().as_bytes().to_vec();
+    for file in files {
+        let bytes = fs::read(file)?;
+        ensure!(
+            bytes
+                .windows(needle.len())
+                .any(|window| window == needle.as_slice()),
+            "expected root {} absent from {}",
+            expected.display(),
+            file.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn debug_comp_dirs(rlib: &Path) -> Result<Vec<String>> {
+    let temp = tempfile::tempdir()?;
+    Command::new("ar")
+        .arg("x")
+        .arg(rlib)
+        .current_dir(temp.path())
+        .assert()
+        .try_success()?;
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(temp.path())? {
+        let object = entry?.path();
+        if object.extension().is_none_or(|ext| ext != "o") {
+            continue;
+        }
+        let output = Command::new("readelf")
+            .args(["--debug-dump=info"])
+            .arg(&object)
+            .output()
+            .context("failed to run readelf")?;
+        ensure!(
+            output.status.success(),
+            "readelf failed for {}",
+            object.display()
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            if let Some((_, dir)) = line.rsplit_once("DW_AT_comp_dir")
+                && let Some((_, dir)) = dir.rsplit_once(": ")
+            {
+                dirs.push(dir.trim().to_owned());
+            }
+        }
+    }
+    ensure!(!dirs.is_empty(), "no DW_AT_comp_dir in {}", rlib.display());
+    dirs.sort();
+    dirs.dedup();
+    Ok(dirs)
+}
+
 #[cfg(unix)]
 fn collect_dep_info_files(target_dir: &Path, crate_prefix: &str) -> Result<Vec<PathBuf>> {
     collect_debug_files_with_ext(target_dir, crate_prefix, "d")
@@ -551,6 +623,8 @@ fn test_cross_root_safe_reuse_and_manifest_dir_isolation() -> Result<()> {
     let slot_b = fs::canonicalize(slot_b)?;
     let proj_a = slot_a.join("project");
     let proj_b = slot_b.join("project");
+    let remap_a = format!("--remap-path-prefix={}=/topsrc", slot_a.display());
+    let remap_b = format!("--remap-path-prefix={}=/topsrc", slot_b.display());
 
     // Reference uncached output in slot_b.
     let uncached_out = run_cargo_run_stdout(
@@ -558,7 +632,7 @@ fn test_cross_root_safe_reuse_and_manifest_dir_isolation() -> Result<()> {
         &proj_b,
         &proj_b.join("target-uncached"),
         None,
-        &[],
+        &[("RUSTFLAGS", Some(&remap_b))],
         false,
     )?;
     let (uncached_val, uncached_manifest) = uncached_out
@@ -579,7 +653,7 @@ fn test_cross_root_safe_reuse_and_manifest_dir_isolation() -> Result<()> {
         &proj_a.join("target"),
         Some(slot_a.as_os_str()),
         false,
-        &[],
+        &[("RUSTFLAGS", Some(&remap_a))],
         true,
     )?;
     let sa = read_stats(&test_info)?;
@@ -595,7 +669,7 @@ fn test_cross_root_safe_reuse_and_manifest_dir_isolation() -> Result<()> {
         &proj_b.join("target"),
         Some(slot_b.as_os_str()),
         false,
-        &[],
+        &[("RUSTFLAGS", Some(&remap_b))],
         true,
     )?;
     let sb = read_stats(&test_info)?;
@@ -604,7 +678,7 @@ fn test_cross_root_safe_reuse_and_manifest_dir_isolation() -> Result<()> {
         &proj_b,
         &proj_b.join("target"),
         Some(slot_b.as_os_str()),
-        &[],
+        &[("RUSTFLAGS", Some(&remap_b))],
         true,
     )?;
     let (cached_val, cached_manifest) = cached_out
@@ -717,6 +791,8 @@ pub fn out_dir() -> &'static str { env!("OUT_DIR") }
     let slot_b = fs::canonicalize(slot_b)?;
     let proj_a = slot_a.join("project");
     let proj_b = slot_b.join("project");
+    let remap_a = format!("--remap-path-prefix={}=/topsrc", slot_a.display());
+    let remap_b = format!("--remap-path-prefix={}=/topsrc", slot_b.display());
 
     // 1. Cold build in slot_a.
     zero_stats()?;
@@ -726,7 +802,7 @@ pub fn out_dir() -> &'static str { env!("OUT_DIR") }
         &proj_a.join("target"),
         Some(slot_a.as_os_str()),
         false,
-        &[],
+        &[("RUSTFLAGS", Some(&remap_a))],
         true,
     )?;
     let s1 = read_stats(&test_info)?;
@@ -742,7 +818,7 @@ pub fn out_dir() -> &'static str { env!("OUT_DIR") }
         &proj_a.join("target"),
         Some(slot_a.as_os_str()),
         false,
-        &[],
+        &[("RUSTFLAGS", Some(&remap_a))],
         true,
     )?;
     let s2 = read_stats(&test_info)?;
@@ -759,7 +835,7 @@ pub fn out_dir() -> &'static str { env!("OUT_DIR") }
         &proj_a.join("target"),
         Some(slot_a.as_os_str()),
         false,
-        &[],
+        &[("RUSTFLAGS", Some(&remap_a))],
         true,
     )?;
     let s3 = read_stats(&test_info)?;
@@ -771,7 +847,7 @@ pub fn out_dir() -> &'static str { env!("OUT_DIR") }
         &proj_a,
         &proj_a.join("target"),
         Some(slot_a.as_os_str()),
-        &[],
+        &[("RUSTFLAGS", Some(&remap_a))],
         true,
     )?;
     let parts_a: Vec<&str> = out_a.trim().split('|').collect();
@@ -799,7 +875,7 @@ fn main() {
         &proj_a.join("target"),
         Some(slot_a.as_os_str()),
         false,
-        &[],
+        &[("RUSTFLAGS", Some(&remap_a))],
         true,
     )?;
     let s4 = read_stats(&test_info)?;
@@ -810,7 +886,7 @@ fn main() {
         &proj_a,
         &proj_a.join("target"),
         Some(slot_a.as_os_str()),
-        &[],
+        &[("RUSTFLAGS", Some(&remap_a))],
         true,
     )?;
     assert!(out_a2.contains("|250|"), "unexpected out_a2: {out_a2}");
@@ -824,7 +900,7 @@ fn main() {
         &proj_b.join("target"),
         Some(slot_b.as_os_str()),
         false,
-        &[],
+        &[("RUSTFLAGS", Some(&remap_b))],
         true,
     )?;
     let s5 = read_stats(&test_info)?;
@@ -839,7 +915,7 @@ fn main() {
         &proj_b,
         &proj_b.join("target"),
         Some(slot_b.as_os_str()),
-        &[],
+        &[("RUSTFLAGS", Some(&remap_b))],
         true,
     )?;
     let parts_b: Vec<&str> = out_b.trim().split('|').collect();
@@ -961,10 +1037,8 @@ fn test_proc_macro_and_remap_path_prefix_cross_root() -> Result<()> {
     assert_eq!(sb_remap.rust_misses, 0);
 
     // 2b. Finish building slot_b (pm_gen + pm_consumer + pm_bin).
-    // On ELF Unix targets, pm_gen.so is reproducible across roots so pm_consumer also hits.
-    // On macOS (Mach-O LC_UUID / N_OSO) and Windows MSVC (COFF timestamp / CodeView PDB GUID/path),
-    // uncached pm_gen dynamic libraries legitimately differ by linker metadata, so sccache must not
-    // false-hit when `--extern pm_gen=...` bytes change.
+    // The proc macro can observe its process environment and spans without a
+    // dep-info entry, so its consumers are never reused across roots.
     zero_stats()?;
     run_cargo_build(
         &test_info,
@@ -976,15 +1050,11 @@ fn test_proc_macro_and_remap_path_prefix_cross_root() -> Result<()> {
         true,
     )?;
     let sb_pm = read_stats(&test_info)?;
-    if cfg!(all(unix, not(target_os = "macos"))) {
-        assert_eq!(
-            sb_pm.rust_hits, 1,
-            "pm_consumer should hit across roots on ELF when source/remap/basedirs match"
-        );
-        assert_eq!(sb_pm.rust_misses, 0);
-    } else {
-        assert_eq!(sb_pm.rust_hits + sb_pm.rust_misses, 1);
-    }
+    assert_eq!(
+        sb_pm.rust_hits, 0,
+        "pm_consumer must not be reused across roots"
+    );
+    assert_eq!(sb_pm.rust_misses, 1);
 
     // Ensure slot_b's rlibs do not contain raw slot_a path bytes.
     let slot_a_bytes = slot_a.to_string_lossy().as_bytes().to_vec();
@@ -1067,6 +1137,330 @@ fn test_proc_macro_and_remap_path_prefix_cross_root() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[serial]
+fn test_proc_macro_untracked_root_lookups_are_not_reused_across_roots() -> Result<()> {
+    let test_info = SccacheTest::new(None)?;
+    let slot_a = test_info.tempdir.path().join("slot-a");
+    let slot_b = test_info.tempdir.path().join("slot-b");
+
+    let write_ws = |slot: &Path| -> Result<()> {
+        let proj = slot.join("project");
+        fs::create_dir_all(proj.join("pm_gen/src"))?;
+        fs::create_dir_all(proj.join("consumer/src"))?;
+        fs::create_dir_all(proj.join("runner/src"))?;
+        fs::write(
+            proj.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"pm_gen\", \"consumer\", \"runner\"]\nresolver = \"2\"\n",
+        )?;
+        fs::write(
+            proj.join("pm_gen/Cargo.toml"),
+            "[package]\nname = \"pm_gen\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\nproc-macro = true\n",
+        )?;
+        // Neither lookup is reported by rustc's dep-info: the macro process reads
+        // them directly instead of going through env!/option_env!.
+        fs::write(
+            proj.join("pm_gen/src/lib.rs"),
+            r#"use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn make_roots(_: TokenStream) -> TokenStream {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let cwd = std::env::current_dir().unwrap().display().to_string();
+    format!(
+        "pub fn manifest() -> &'static str {{ {:?} }}\npub fn cwd() -> &'static str {{ {:?} }}",
+        manifest, cwd
+    )
+    .parse()
+    .unwrap()
+}
+"#,
+        )?;
+        fs::write(
+            proj.join("consumer/Cargo.toml"),
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\npm_gen = { path = \"../pm_gen\" }\n",
+        )?;
+        fs::write(
+            proj.join("consumer/src/lib.rs"),
+            "pm_gen::make_roots!();\npub fn roots() -> (&'static str, &'static str) { (manifest(), cwd()) }\n",
+        )?;
+        fs::write(
+            proj.join("runner/Cargo.toml"),
+            "[package]\nname = \"runner\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nconsumer = { path = \"../consumer\" }\n",
+        )?;
+        fs::write(
+            proj.join("runner/src/main.rs"),
+            "fn main() { let (m, c) = consumer::roots(); println!(\"{m}|{c}\"); }\n",
+        )?;
+        Ok(())
+    };
+
+    write_ws(&slot_a)?;
+    write_ws(&slot_b)?;
+    let slot_a = fs::canonicalize(slot_a)?;
+    let slot_b = fs::canonicalize(slot_b)?;
+    let proj_a = slot_a.join("project");
+    let proj_b = slot_b.join("project");
+
+    let remap_a = format!("--remap-path-prefix={}=/topsrc", slot_a.display());
+    let remap_b = format!("--remap-path-prefix={}=/topsrc", slot_b.display());
+
+    // Reference output from a direct, uncached build in slot-b.
+    let uncached_out = run_cargo_run_stdout(
+        &test_info,
+        &proj_b,
+        &proj_b.join("target-uncached"),
+        None,
+        &[("RUSTFLAGS", Some(&remap_b))],
+        false,
+    )?;
+    ensure!(
+        uncached_out.trim().starts_with(slot_b.to_str().unwrap()),
+        "unexpected uncached output: {uncached_out}"
+    );
+    ensure!(!uncached_out.contains(slot_a.to_str().unwrap()));
+
+    // The proc-macro dylib is reproducible with the same remap, so the consumer
+    // would otherwise hit across roots. Its output is root-dependent through the
+    // macro's untracked reads and must not be reused.
+    zero_stats()?;
+    run_cargo_build(
+        &test_info,
+        &proj_a,
+        &proj_a.join("target"),
+        Some(slot_a.as_os_str()),
+        false,
+        &[("RUSTFLAGS", Some(&remap_a))],
+        true,
+    )?;
+    let sa = read_stats(&test_info)?;
+    ensure!(sa.rust_hits == 0, "unexpected slot-a hits: {sa:?}");
+    ensure!(sa.rust_misses == 1, "unexpected slot-a misses: {sa:?}");
+
+    zero_stats()?;
+    run_cargo_build(
+        &test_info,
+        &proj_b,
+        &proj_b.join("target"),
+        Some(slot_b.as_os_str()),
+        false,
+        &[("RUSTFLAGS", Some(&remap_b))],
+        true,
+    )?;
+    let sb = read_stats(&test_info)?;
+    ensure!(
+        sb.rust_hits == 0,
+        "proc-macro consumer must not hit across roots: {sb:?}"
+    );
+    ensure!(
+        sb.rust_misses == 1,
+        "proc-macro consumer must be rebuilt in the consuming root: {sb:?}"
+    );
+
+    let consumer_rlibs =
+        collect_debug_files_with_ext(&proj_b.join("target"), "libconsumer", "rlib")?;
+    assert_files_lack_path(&consumer_rlibs, &slot_a)?;
+
+    let cached_out = run_cargo_run_stdout(
+        &test_info,
+        &proj_b,
+        &proj_b.join("target"),
+        Some(slot_b.as_os_str()),
+        &[("RUSTFLAGS", Some(&remap_b))],
+        true,
+    )?;
+    ensure!(
+        cached_out == uncached_out,
+        "cached slot-b output {cached_out:?} differs from uncached {uncached_out:?}"
+    );
+    ensure!(!cached_out.contains(slot_a.to_str().unwrap()));
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_debuginfo_without_remap_is_not_reused_across_roots() -> Result<()> {
+    let test_info = SccacheTest::new(None)?;
+    let slot_a = test_info.tempdir.path().join("slot-a");
+    let slot_b = test_info.tempdir.path().join("slot-b");
+
+    for slot in [&slot_a, &slot_b] {
+        let proj = slot.join("project");
+        fs::create_dir_all(proj.join("src"))?;
+        fs::write(
+            proj.join("Cargo.toml"),
+            "[package]\nname = \"debug_lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(
+            proj.join("src/lib.rs"),
+            "#[inline(never)]\npub fn add(a: u32, b: u32) -> u32 { a.wrapping_add(b) }\n",
+        )?;
+    }
+
+    let slot_a = fs::canonicalize(slot_a)?;
+    let slot_b = fs::canonicalize(slot_b)?;
+    let proj_a = slot_a.join("project");
+    let proj_b = slot_b.join("project");
+    let debuginfo = ["-C", "debuginfo=2"].join(" ");
+    let flags = [("RUSTFLAGS", Some(debuginfo.as_str()))];
+
+    // Reference debug info from a direct build in slot-b.
+    let uncached_target = proj_b.join("target-uncached");
+    run_cargo_build(
+        &test_info,
+        &proj_b,
+        &uncached_target,
+        None,
+        false,
+        &flags,
+        false,
+    )?;
+
+    zero_stats()?;
+    run_cargo_build(
+        &test_info,
+        &proj_a,
+        &proj_a.join("target"),
+        Some(slot_a.as_os_str()),
+        false,
+        &flags,
+        true,
+    )?;
+    let sa = read_stats(&test_info)?;
+    ensure!(sa.rust_hits == 0 && sa.rust_misses == 1, "{sa:?}");
+
+    zero_stats()?;
+    run_cargo_build(
+        &test_info,
+        &proj_b,
+        &proj_b.join("target"),
+        Some(slot_b.as_os_str()),
+        false,
+        &flags,
+        true,
+    )?;
+    let sb = read_stats(&test_info)?;
+    ensure!(
+        sb.rust_hits == 0 && sb.rust_misses == 1,
+        "debug build without a covering remap must miss across roots: {sb:?}"
+    );
+
+    let cached = collect_debug_files_with_ext(&proj_b.join("target"), "libdebug_lib", "rlib")?;
+    let uncached = collect_debug_files_with_ext(&uncached_target, "libdebug_lib", "rlib")?;
+    assert_files_lack_path(&cached, &slot_a)?;
+    assert_files_contain_path(&cached, &slot_b)?;
+
+    #[cfg(target_os = "linux")]
+    for rlib in &cached {
+        ensure!(
+            debug_comp_dirs(rlib)? == debug_comp_dirs(&uncached[0])?,
+            "cached debug info {} differs from the local build",
+            rlib.display()
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_debuginfo_with_remap_is_reused_across_roots() -> Result<()> {
+    let test_info = SccacheTest::new(None)?;
+    let slot_a = test_info.tempdir.path().join("slot-a");
+    let slot_b = test_info.tempdir.path().join("slot-b");
+
+    for slot in [&slot_a, &slot_b] {
+        let proj = slot.join("project");
+        fs::create_dir_all(proj.join("src"))?;
+        fs::write(
+            proj.join("Cargo.toml"),
+            "[package]\nname = \"debug_lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(
+            proj.join("src/lib.rs"),
+            "#[inline(never)]\npub fn add(a: u32, b: u32) -> u32 { a.wrapping_add(b) }\n",
+        )?;
+    }
+
+    let slot_a = fs::canonicalize(slot_a)?;
+    let slot_b = fs::canonicalize(slot_b)?;
+    let proj_a = slot_a.join("project");
+    let proj_b = slot_b.join("project");
+    let flags_a = format!(
+        "-C debuginfo=2 --remap-path-prefix={}=/topsrc",
+        slot_a.display()
+    );
+    let flags_b = format!(
+        "-C debuginfo=2 --remap-path-prefix={}=/topsrc",
+        slot_b.display()
+    );
+
+    let uncached_target = proj_b.join("target-uncached");
+    run_cargo_build(
+        &test_info,
+        &proj_b,
+        &uncached_target,
+        None,
+        false,
+        &[("RUSTFLAGS", Some(&flags_b))],
+        false,
+    )?;
+
+    zero_stats()?;
+    run_cargo_build(
+        &test_info,
+        &proj_a,
+        &proj_a.join("target"),
+        Some(slot_a.as_os_str()),
+        false,
+        &[("RUSTFLAGS", Some(&flags_a))],
+        true,
+    )?;
+    let sa = read_stats(&test_info)?;
+    ensure!(sa.rust_hits == 0 && sa.rust_misses == 1, "{sa:?}");
+
+    zero_stats()?;
+    run_cargo_build(
+        &test_info,
+        &proj_b,
+        &proj_b.join("target"),
+        Some(slot_b.as_os_str()),
+        false,
+        &[("RUSTFLAGS", Some(&flags_b))],
+        true,
+    )?;
+    let sb = read_stats(&test_info)?;
+    ensure!(
+        sb.rust_hits == 1 && sb.rust_misses == 0,
+        "a remapped debug build should reuse the cache: {sb:?}"
+    );
+
+    let cached = collect_debug_files_with_ext(&proj_b.join("target"), "libdebug_lib", "rlib")?;
+    let uncached = collect_debug_files_with_ext(&uncached_target, "libdebug_lib", "rlib")?;
+    assert_files_lack_path(&cached, &slot_a)?;
+    assert_files_lack_path(&cached, &slot_b)?;
+    assert_files_contain_path(&cached, Path::new("/topsrc"))?;
+
+    #[cfg(target_os = "linux")]
+    for rlib in &cached {
+        ensure!(
+            debug_comp_dirs(rlib)? == debug_comp_dirs(&uncached[0])?,
+            "cached debug info {} differs from the local build",
+            rlib.display()
+        );
+        ensure!(
+            debug_comp_dirs(rlib)?
+                .iter()
+                .all(|dir| dir.starts_with("/topsrc")),
+            "cached debug info {} was not remapped",
+            rlib.display()
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 #[serial]
@@ -1101,6 +1495,9 @@ fn test_paths_with_spaces_and_unicode_and_dep_info_integrity() -> Result<()> {
     let slot_b = fs::canonicalize(slot_b)?;
     let proj_a = slot_a.join("my project");
     let proj_b = slot_b.join("my project");
+    // CARGO_ENCODED_RUSTFLAGS keeps the path with spaces as one argument.
+    let encoded_a = format!("--remap-path-prefix={}=/topsrc", slot_a.display());
+    let encoded_b = format!("--remap-path-prefix={}=/topsrc", slot_b.display());
 
     // 1. Build slot A.
     zero_stats()?;
@@ -1110,7 +1507,7 @@ fn test_paths_with_spaces_and_unicode_and_dep_info_integrity() -> Result<()> {
         &proj_a.join("target"),
         Some(slot_a.as_os_str()),
         false,
-        &[],
+        &[("CARGO_ENCODED_RUSTFLAGS", Some(&encoded_a))],
         true,
     )?;
     let sa = read_stats(&test_info)?;
@@ -1125,7 +1522,7 @@ fn test_paths_with_spaces_and_unicode_and_dep_info_integrity() -> Result<()> {
         &proj_b.join("target"),
         Some(slot_b.as_os_str()),
         false,
-        &[],
+        &[("CARGO_ENCODED_RUSTFLAGS", Some(&encoded_b))],
         true,
     )?;
     let sb = read_stats(&test_info)?;
@@ -1143,7 +1540,7 @@ fn test_paths_with_spaces_and_unicode_and_dep_info_integrity() -> Result<()> {
         &proj_b,
         &proj_b.join("target"),
         Some(slot_b.as_os_str()),
-        &[],
+        &[("CARGO_ENCODED_RUSTFLAGS", Some(&encoded_b))],
         true,
     )?;
     assert_eq!(out1.trim(), "こんにちは v1");
@@ -1163,7 +1560,7 @@ fn test_paths_with_spaces_and_unicode_and_dep_info_integrity() -> Result<()> {
         &proj_b.join("target"),
         Some(slot_b.as_os_str()),
         false,
-        &[],
+        &[("CARGO_ENCODED_RUSTFLAGS", Some(&encoded_b))],
         true,
     )?;
     let s_inc = read_stats(&test_info)?;
@@ -1176,7 +1573,7 @@ fn test_paths_with_spaces_and_unicode_and_dep_info_integrity() -> Result<()> {
         &proj_b,
         &proj_b.join("target"),
         Some(slot_b.as_os_str()),
-        &[],
+        &[("CARGO_ENCODED_RUSTFLAGS", Some(&encoded_b))],
         true,
     )?;
     assert_eq!(out2.trim(), "こんにちは v2 updated");
@@ -1220,6 +1617,8 @@ fn test_dep_info_written_locally_for_cross_root_hits() -> Result<()> {
     let slot_b = fs::canonicalize(slot_b)?;
     let proj_a = slot_a.join("project");
     let proj_b = slot_b.join("project");
+    let remap_a = format!("--remap-path-prefix={}=/topsrc", slot_a.display());
+    let remap_b = format!("--remap-path-prefix={}=/topsrc", slot_b.display());
 
     zero_stats()?;
     run_cargo_build(
@@ -1228,7 +1627,7 @@ fn test_dep_info_written_locally_for_cross_root_hits() -> Result<()> {
         &proj_a.join("target"),
         Some(slot_a.as_os_str()),
         false,
-        &[],
+        &[("RUSTFLAGS", Some(&remap_a))],
         true,
     )?;
     let sa = read_stats(&test_info)?;
@@ -1268,7 +1667,7 @@ fn test_dep_info_written_locally_for_cross_root_hits() -> Result<()> {
         &proj_b.join("target"),
         Some(OsStr::new(&multi)),
         false,
-        &[],
+        &[("RUSTFLAGS", Some(&remap_b))],
         true,
     )?;
     let sb = read_stats(&test_info)?;
@@ -1288,7 +1687,7 @@ fn test_dep_info_written_locally_for_cross_root_hits() -> Result<()> {
         &proj_b.join("target"),
         Some(slot_b.as_os_str()),
         false,
-        &[],
+        &[("RUSTFLAGS", Some(&remap_b))],
         true,
     )?;
     let sb2 = read_stats(&test_info)?;
@@ -1380,6 +1779,10 @@ fn test_concurrent_multi_root_multi_crate_requests() -> Result<()> {
         .into_iter()
         .map(fs::canonicalize)
         .collect::<std::io::Result<Vec<_>>>()?;
+    let remaps = roots
+        .iter()
+        .map(|root| format!("--remap-path-prefix={}=/topsrc", root.display()))
+        .collect::<Vec<_>>();
 
     for client_side in [false, true] {
         // Fresh cache per mode so hit counts remain deterministic.
@@ -1397,7 +1800,7 @@ fn test_concurrent_multi_root_multi_crate_requests() -> Result<()> {
             &roots[0].join("proj/target"),
             Some(roots[0].as_os_str()),
             client_side,
-            &[],
+            &[("RUSTFLAGS", Some(remaps[0].as_str()))],
             true,
         )?;
         run_cargo_build(
@@ -1406,7 +1809,7 @@ fn test_concurrent_multi_root_multi_crate_requests() -> Result<()> {
             &roots[2].join("proj/target"),
             Some(roots[2].as_os_str()),
             client_side,
-            &[],
+            &[("RUSTFLAGS", Some(remaps[2].as_str()))],
             true,
         )?;
 
@@ -1416,14 +1819,14 @@ fn test_concurrent_multi_root_multi_crate_requests() -> Result<()> {
         zero_stats()?;
 
         let mut children = Vec::new();
-        for root in &roots {
+        for (index, root) in roots.iter().enumerate() {
             let child = build_cargo_command(
                 &test_info,
                 &root.join("proj"),
                 &root.join("proj/target"),
                 Some(root.as_os_str()),
                 client_side,
-                &[],
+                &[("RUSTFLAGS", Some(remaps[index].as_str()))],
                 true,
             )
             .spawn()?;
@@ -1448,7 +1851,7 @@ fn test_concurrent_multi_root_multi_crate_requests() -> Result<()> {
             &roots[1].join("proj"),
             &roots[1].join("proj/target"),
             Some(roots[1].as_os_str()),
-            &[],
+            &[("RUSTFLAGS", Some(remaps[1].as_str()))],
             true,
         )?;
         let (v2, m2) = out_2.trim().split_once('|').context("bad slot-2 output")?;
@@ -1467,7 +1870,7 @@ fn test_concurrent_multi_root_multi_crate_requests() -> Result<()> {
             &roots[3].join("proj"),
             &roots[3].join("proj/target"),
             Some(roots[3].as_os_str()),
-            &[],
+            &[("RUSTFLAGS", Some(remaps[3].as_str()))],
             true,
         )?;
         assert_eq!(out_4.trim(), "202");

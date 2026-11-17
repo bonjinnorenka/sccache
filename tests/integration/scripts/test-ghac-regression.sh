@@ -184,6 +184,7 @@ if [ "$ROLE" = "seed" ]; then
         cd "$SLOT_A/project" && \
         RUSTC_WRAPPER="$SCCACHE_BIN" \
         SCCACHE_BASEDIRS="$SLOT_A" \
+        RUSTFLAGS="--remap-path-prefix=$SLOT_A=/topsrc" \
         CARGO_TARGET_DIR="$SLOT_A/project/target" \
         cargo build --locked --offline
     )
@@ -272,6 +273,7 @@ t0="$(python3 -c 'import time; print(time.monotonic())')"
     cd "$SLOT_B/project" && \
     RUSTC_WRAPPER="$SCCACHE_BIN" \
     SCCACHE_BASEDIRS="$SLOT_B" \
+    RUSTFLAGS="--remap-path-prefix=$SLOT_B=/topsrc" \
     CARGO_TARGET_DIR="$SLOT_B/project/target" \
     cargo build --locked --offline
 )
@@ -317,6 +319,7 @@ t0="$(python3 -c 'import time; print(time.monotonic())')"
     cd "$SLOT_B/project" && \
     RUSTC_WRAPPER="$SCCACHE_BIN" \
     SCCACHE_BASEDIRS="$SLOT_B" \
+    RUSTFLAGS="--remap-path-prefix=$SLOT_B=/topsrc" \
     CARGO_TARGET_DIR="$SLOT_B/project/target" \
     cargo build --locked --offline
 )

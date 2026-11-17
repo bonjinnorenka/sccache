@@ -432,7 +432,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"8";
+const CACHE_VERSION: &[u8] = b"9";
 
 fn hash_rust_value(digest: &mut Digest, value: &OsStr, basedirs: Option<&[Vec<u8>]>) {
     let encoded = encode_rust_value(value);
@@ -515,6 +515,103 @@ fn is_path_cargo_env(var: &OsStr) -> bool {
                 | "CARGO_TARGET_TMPDIR"
         )
     ) || var.as_encoded_bytes().starts_with(b"CARGO_BIN_EXE_")
+}
+
+/// A dynamic library on the `--extern` list may be a procedural macro.
+///
+/// Cargo passes proc-macro crates as `.so`/`.dylib`/`.dll`, and rustc's
+/// dep-info does not record anything a macro reads at expansion time. Treat
+/// every dynamic-library extern as a proc macro: failing to normalize the
+/// paths only costs a cross-root miss, while guessing wrong bakes the foreign
+/// root into the generated code.
+fn has_proc_macro_extern(externs: &[PathBuf]) -> bool {
+    externs.iter().any(|path| {
+        path.extension()
+            .is_some_and(|extension| extension == DLL_EXTENSION)
+    })
+}
+
+/// The source side of every `--remap-path-prefix`.
+fn remap_prefixes(arguments: &[(OsString, Option<OsString>)]) -> Vec<PathBuf> {
+    arguments
+        .iter()
+        .filter(|(arg, _)| arg == "--remap-path-prefix")
+        .filter_map(|(_, value)| value.as_deref())
+        .filter_map(|value| value.to_str())
+        .filter_map(|value| value.rsplit_once('=').map(|(source, _)| source))
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// `--remap-path-scope` defaults to `all`. Any narrower scope leaves raw
+/// build-root paths in crate metadata, which is part of the cached `.rlib`.
+fn remap_scope_covers_metadata(arguments: &[(OsString, Option<OsString>)]) -> bool {
+    let mut explicit = false;
+    let mut all = false;
+    for (arg, value) in arguments {
+        if arg != "--remap-path-scope" {
+            continue;
+        }
+        explicit = true;
+        if let Some(value) = value.as_deref().and_then(OsStr::to_str) {
+            all |= value.split(',').any(|scope| scope == "all");
+        }
+    }
+    !explicit || all
+}
+
+fn remap_covers_path(prefixes: &[PathBuf], path: &Path) -> bool {
+    prefixes.iter().any(|prefix| path.starts_with(prefix))
+}
+
+/// Paths that rustc embeds in the output can only be normalized across roots
+/// when the user asks rustc to rewrite the same paths in the artifact.
+///
+/// `rustc` writes the working directory and source names into debug info and
+/// crate metadata. A cache hit copies those bytes verbatim, so stripping the
+/// basedir from the cache key alone would hand `root-b` an artifact that names
+/// `root-a`. Cross-root reuse therefore needs a `--remap-path-prefix` that
+/// covers the paths basedirs strips and a scope that includes metadata.
+/// Without both, keep the raw paths in the key and let the compile miss.
+fn effective_basedirs<'a>(
+    basedirs: Option<&'a [Vec<u8>]>,
+    cwd: &Path,
+    arguments: &[(OsString, Option<OsString>)],
+    externs: &[PathBuf],
+) -> Option<&'a [Vec<u8>]> {
+    let basedirs = basedirs?;
+    if has_proc_macro_extern(externs) {
+        debug!("not normalizing Rust paths: the compile uses a procedural macro");
+        return None;
+    }
+    if !remap_scope_covers_metadata(arguments) {
+        debug!("not normalizing Rust paths: --remap-path-scope excludes metadata");
+        return None;
+    }
+    let prefixes = remap_prefixes(arguments);
+    let cwd_encoded = encode_rust_value(cwd.as_os_str());
+    let cwd_is_normalized = strip_path_basedirs(cwd_encoded, basedirs).len() != cwd_encoded.len();
+    if cwd_is_normalized && !remap_covers_path(&prefixes, cwd) {
+        debug!("not normalizing Rust paths: cwd is not covered by --remap-path-prefix");
+        return None;
+    }
+    Some(basedirs)
+}
+
+fn sources_are_remapped(
+    sources: &[PathBuf],
+    basedirs: &[Vec<u8>],
+    arguments: &[(OsString, Option<OsString>)],
+) -> bool {
+    let prefixes = remap_prefixes(arguments);
+    sources.iter().all(|source| {
+        let encoded = encode_rust_value(source.as_os_str());
+        // Only paths the basedir actually strips can be shared across roots.
+        // Other sources keep their absolute path in the cache key, so a
+        // different path already forces a miss.
+        strip_path_basedirs(encoded, basedirs).len() == encoded.len()
+            || remap_covers_path(&prefixes, source)
+    })
 }
 
 /// Run `rustc --emit=dep-info` to get the list of source files and env-deps.
@@ -1771,8 +1868,6 @@ where
         _cache_control: CacheControl,
     ) -> Result<HashResult<T>> {
         trace!("[{}]: generate_hash_key", self.parsed_args.crate_name);
-        let basedirs = storage.basedirs();
-        let basedirs = (!basedirs.is_empty()).then_some(basedirs);
         // TODO: this doesn't produce correct arguments if they should be concatenated - should use iter_os_strings
         let os_string_arguments: Vec<(OsString, Option<OsString>)> = self
             .parsed_args
@@ -1785,6 +1880,14 @@ where
                 )
             })
             .collect();
+        let basedirs = storage.basedirs();
+        let basedirs = (!basedirs.is_empty()).then_some(basedirs);
+        let basedirs = effective_basedirs(
+            basedirs,
+            &cwd,
+            &os_string_arguments,
+            &self.parsed_args.externs,
+        );
         // `filtered_arguments` omits --emit and --out-dir arguments.
         // It's used for invoking rustc with `--emit=dep-info` to get the list of
         // source files for this crate.
@@ -1813,9 +1916,22 @@ where
                 pool,
             )
             .await?;
-            sort_paths_for_hash(&mut source_files, basedirs);
+            let sources_remapped = match basedirs {
+                Some(basedirs) => {
+                    sources_are_remapped(&source_files, basedirs, &os_string_arguments)
+                }
+                None => true,
+            };
+            let effective_basedirs = if sources_remapped { basedirs } else { None };
+            sort_paths_for_hash(&mut source_files, effective_basedirs);
             let source_hashes = hash_all(&source_files, &source_hashes_pool).await?;
-            Ok((source_files, source_hashes, env_deps, dep_info))
+            Ok((
+                source_files,
+                source_hashes,
+                env_deps,
+                dep_info,
+                sources_remapped,
+            ))
         };
 
         // Turn arguments into a simple Vec<OsString> to calculate outputs.
@@ -1877,7 +1993,7 @@ where
 
         // Invoke the compiler and perform all hashing operations on the files.
         let (
-            (source_files, source_hashes, mut env_deps, dep_info_text),
+            (source_files, source_hashes, mut env_deps, dep_info_text, sources_remapped),
             extern_hashes,
             staticlib_hashes,
             target_json_hash,
@@ -1889,6 +2005,7 @@ where
             target_json_hash,
             outputs,
         )?;
+        let basedirs = if sources_remapped { basedirs } else { None };
 
         // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
         let mut m = Digest::new();
@@ -1949,7 +2066,16 @@ where
         {
             m.update(h.as_bytes());
         }
-        // 8. Environment variables: Hash all environment variables listed in the rustc dep-info
+        // 8. The normalized path of every source file. Paths under a basedir
+        //    collapse across roots; paths outside one stay absolute, so two
+        //    checkouts with a different dependency location cannot share an
+        //    artifact that embeds the old one.
+        m.delimiter(b"rust-source-paths");
+        m.update(&(source_files.len() as u64).to_le_bytes());
+        for source in &source_files {
+            hash_rust_value(&mut m, source.as_os_str(), basedirs);
+        }
+        // 9. Environment variables: Hash all environment variables listed in the rustc dep-info
         //    output. Additionally also has all environment variables starting with `CARGO_`,
         //    since those are not listed in dep-info but affect cacheability.
         env_deps.sort();
@@ -2005,10 +2131,10 @@ where
             };
             hash_rust_value(&mut m, val, normalizer);
         }
-        // 9. The cwd of the compile. This will wind up in the rlib.
+        // 10. The cwd of the compile. This will wind up in the rlib.
         m.delimiter(b"rust-cwd");
         hash_rust_value(&mut m, cwd.as_os_str(), basedirs);
-        // 10. The version of the compiler.
+        // 11. The version of the compiler.
         self.version.hash(&mut HashToDigest { digest: &mut m });
 
         // metadata / dep-info don't ever generate binaries, but
@@ -4185,6 +4311,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         }
         // libbaz.a contains baz.o, consisting of 1024 bytes of zeroes.
         m.update(libbaz_a_digest.as_bytes());
+        // Normalized source paths.
+        m.delimiter(b"rust-source-paths");
+        m.update(&2_u64.to_le_bytes());
+        hash_rust_value(&mut m, f.tempdir.path().join("bar.rs").as_os_str(), None);
+        hash_rust_value(&mut m, f.tempdir.path().join("foo.rs").as_os_str(), None);
         // rustc environment dependencies.
         m.delimiter(b"rust-env-deps");
         m.update(&0_u64.to_le_bytes());
@@ -4439,6 +4570,99 @@ foo.rs:
         assert_eq!(
             keys(&first, &first_basedirs),
             keys(&second, &second_basedirs)
+        );
+    }
+
+    #[test]
+    fn test_rust_basedirs_require_covering_remap() {
+        let basedirs = [b"/work/root/".to_vec()];
+        let basedirs = basedirs.as_slice();
+        let cwd = Path::new("/work/root/project");
+        let os = |pairs: &[(&str, Option<&str>)]| {
+            pairs
+                .iter()
+                .map(|(arg, value)| (OsString::from(*arg), value.map(OsString::from)))
+                .collect::<Vec<_>>()
+        };
+
+        let plain = os(&[("-C", Some("debuginfo=2"))]);
+        assert!(
+            effective_basedirs(Some(basedirs), cwd, &plain, &[]).is_none(),
+            "normalizing without remapping would embed foreign root paths"
+        );
+        assert!(
+            effective_basedirs(
+                Some(basedirs),
+                Path::new("/cargo/registry/src/index/crate-1.0.0"),
+                &plain,
+                &[]
+            )
+            .is_some(),
+            "a dependency outside every basedir keeps its raw path in the key"
+        );
+
+        let remap = os(&[
+            ("-C", Some("debuginfo=2")),
+            (
+                "--remap-path-prefix",
+                Some("/work/root/project=/topsrc/project"),
+            ),
+        ]);
+        assert!(effective_basedirs(Some(basedirs), cwd, &remap, &[]).is_some());
+
+        let narrow_scope = os(&[
+            ("--remap-path-prefix", Some("/work/root/project=/topsrc")),
+            ("--remap-path-scope", Some("debuginfo")),
+        ]);
+        assert!(
+            effective_basedirs(Some(basedirs), cwd, &narrow_scope, &[]).is_none(),
+            "a debuginfo-only scope leaves root paths in crate metadata"
+        );
+
+        let all_scope = os(&[
+            ("--remap-path-prefix", Some("/work/root/project=/topsrc")),
+            ("--remap-path-scope", Some("debuginfo,object,all")),
+        ]);
+        assert!(effective_basedirs(Some(basedirs), cwd, &all_scope, &[]).is_some());
+
+        let outside_remap = os(&[("--remap-path-prefix", Some("/elsewhere=/topsrc"))]);
+        assert!(effective_basedirs(Some(basedirs), cwd, &outside_remap, &[]).is_none());
+
+        assert!(has_proc_macro_extern(&[PathBuf::from(format!(
+            "libpm.{}",
+            DLL_EXTENSION
+        ))]));
+        assert!(!has_proc_macro_extern(&[PathBuf::from("libdep.rlib")]));
+        assert!(
+            effective_basedirs(
+                Some(basedirs),
+                cwd,
+                &remap,
+                &[PathBuf::from(format!("libpm.{}", DLL_EXTENSION))]
+            )
+            .is_none(),
+            "proc-macro consumers must never reuse another root's expansion"
+        );
+
+        assert!(!sources_are_remapped(
+            &[PathBuf::from("/work/root/project/src/lib.rs")],
+            basedirs,
+            &outside_remap
+        ));
+        assert!(sources_are_remapped(
+            &[PathBuf::from("/work/root/project/src/lib.rs")],
+            basedirs,
+            &remap
+        ));
+        assert!(
+            sources_are_remapped(
+                &[PathBuf::from(
+                    "/cargo/registry/src/index/serde-1.0.0/src/lib.rs"
+                )],
+                basedirs,
+                &remap
+            ),
+            "a dependency outside every basedir keeps its absolute path in the key"
         );
     }
 

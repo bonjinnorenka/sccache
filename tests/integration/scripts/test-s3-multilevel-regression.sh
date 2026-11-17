@@ -161,6 +161,7 @@ run_cargo_and_verify() {
         # shellcheck disable=SC2086
         RUSTC_WRAPPER="$SCCACHE_BIN" \
         SCCACHE_BASEDIRS="$slot" \
+        RUSTFLAGS="--remap-path-prefix=$slot=/topsrc" \
         CARGO_TARGET_DIR="$target" \
         cargo build --locked --offline $cargo_args
     )
@@ -429,12 +430,14 @@ PY
     (
         cd "$SLOT_A/project" && \
         RUSTC_WRAPPER="$SCCACHE_BIN" SCCACHE_BASEDIRS="$SLOT_A" \
+        RUSTFLAGS="--remap-path-prefix=$SLOT_A=/topsrc" \
         CARGO_TARGET_DIR="$SLOT_A/project/target_s10" cargo build --locked --offline
     ) &
     pid_a=$!
     (
         cd "$SLOT_B/project" && \
         RUSTC_WRAPPER="$SCCACHE_BIN" SCCACHE_BASEDIRS="$SLOT_B" \
+        RUSTFLAGS="--remap-path-prefix=$SLOT_B=/topsrc" \
         CARGO_TARGET_DIR="$SLOT_B/project/target_s10" cargo build --locked --offline
     ) &
     pid_b=$!

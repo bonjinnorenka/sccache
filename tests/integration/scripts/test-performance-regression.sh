@@ -153,6 +153,7 @@ run_fixture_perf() {
             cd "$slot/project" && \
             RUSTC_WRAPPER="$SCCACHE_BIN" \
             SCCACHE_BASEDIRS="$slot" \
+            RUSTFLAGS="--remap-path-prefix=$slot=/topsrc" \
             CARGO_TARGET_DIR="$slot/project/target" \
             cargo build --locked --offline
         )

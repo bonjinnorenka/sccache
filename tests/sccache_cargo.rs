@@ -393,6 +393,10 @@ fn cargo_run_stdout(test_info: &SccacheTest, root: &Path) -> Result<String> {
         .args(["run", "--quiet", "--color=never"])
         .envs(test_info.env.iter().cloned())
         .env("CARGO_TARGET_DIR", root.join("target"))
+        .env(
+            "RUSTFLAGS",
+            format!("--remap-path-prefix={}=/topsrc", root.display()),
+        )
         .current_dir(root)
         .assert()
         .try_success()?
@@ -484,6 +488,10 @@ fn cargo_build_command(
         .args(["build", "--color=never"])
         .envs(test_info.env.iter().cloned())
         .env("CARGO_TARGET_DIR", root.join("target"))
+        .env(
+            "RUSTFLAGS",
+            format!("--remap-path-prefix={}=/topsrc", root.display()),
+        )
         .env_remove("SCCACHE_BASEDIRS")
         .env_remove("SCCACHE_CLIENT_SIDE")
         .current_dir(root);

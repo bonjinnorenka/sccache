@@ -115,8 +115,10 @@ run_compat_build() {
         cd "$proj_dir"
         if [ -n "$slot" ]; then
             export SCCACHE_BASEDIRS="$slot"
+            export RUSTFLAGS="--remap-path-prefix=$slot=/topsrc"
         else
             unset SCCACHE_BASEDIRS || true
+            unset RUSTFLAGS || true
         fi
         RUSTC_WRAPPER="$SCCACHE_BIN" \
         CARGO_TARGET_DIR="$target" \
@@ -142,6 +144,7 @@ verify_slot() {
     local out
     out="$(
         cd "$slot/project" && \
+        RUSTFLAGS="--remap-path-prefix=$slot=/topsrc" \
         run_with_toolchain "$TARGET_TOOLCHAIN" env -u RUSTC_WRAPPER CARGO_TARGET_DIR="$target" \
         cargo run --locked --offline -q -p small-app
     )"
@@ -154,6 +157,7 @@ verify_slot() {
     }
     (
         cd "$slot/project" && \
+        RUSTFLAGS="--remap-path-prefix=$slot=/topsrc" \
         run_with_toolchain "$TARGET_TOOLCHAIN" env -u RUSTC_WRAPPER CARGO_TARGET_DIR="$target" \
         cargo test --locked --offline -p small-manifest
     )
