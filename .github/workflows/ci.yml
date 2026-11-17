@@ -331,7 +331,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME:-${GITHUB_SHA::12}}"
+          if [[ "${GITHUB_REF_TYPE}" == tag ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="${GITHUB_SHA::12}"
+          fi
           package="sccache-${version}-x86_64-unknown-linux-musl"
           mkdir -p "release-package/$package"
           cp target/x86_64-unknown-linux-musl/release/sccache README.md LICENSE "release-package/$package/"
