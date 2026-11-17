@@ -1,6 +1,12 @@
 # Sccache Release Process
 
-Most of the sccache release process is automated. The [github workflow](https://github.com/mozilla/sccache/actions?query=workflow%3Aci) contains builds for all supported platforms, as well as a release job that is triggered by pushing a new tag to the repository. That job will upload the resulting binary packages to [the GitHub releases page](https://github.com/mozilla/sccache/releases) on the repository.
+This fork publishes only an Ubuntu Linux x86_64 musl binary. The `ci` workflow
+validates the tagged commit, Rust cache correctness, Disk and S3 regressions,
+cross-job GHAC reuse, Rust beta compatibility, and the release binary smoke
+test before creating a GitHub Release. The archive includes a SHA-256 file.
+Pull requests run the smoke test but do not publish. If a release already
+exists for a tag, the workflow refuses to replace it. See [Fork CI](CI.md) for
+the required checks and GHAC behavior on fork pull requests.
 
 # Producing a release
 
