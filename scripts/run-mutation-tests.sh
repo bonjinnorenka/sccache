@@ -11,7 +11,11 @@ SUITE="${1:-pr1}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/sccache-mutation-XXXXXX")"
 SILO_COMPOSE="$REPO_ROOT/tests/integration/docker-compose.yml"
 SILO_STARTED=0
+GHAC_MOCK_PID=""
 cleanup() {
+    if [ -n "$GHAC_MOCK_PID" ]; then
+        kill "$GHAC_MOCK_PID" >/dev/null 2>&1 || true
+    fi
     if [ "$SILO_STARTED" -eq 1 ]; then
         docker compose -f "$SILO_COMPOSE" --profile s3 down -v >/dev/null 2>&1 || true
     fi
@@ -202,6 +206,155 @@ new = "async fn get_with_raw(&self, key: &str) -> Result<(Cache, Option<Bytes>)>
 p.write_text(txt.replace(old, new, 1))
 ' \
         "cargo build --locked --bin sccache && SCCACHE_BIN=\"\$PWD/target/debug/sccache\" SCENARIOS=core SKIP_SILO_SETUP=1 KEEP_SILO=1 REPORT_DIR=\"$WORK/report-m5\" bash tests/integration/scripts/test-s3-multilevel-regression.sh" \
+        "STATS_VERIFY"
+fi
+
+if [ "$SUITE" = "pr3" ] || [ "$SUITE" = "all" ]; then
+    echo "Starting local GHAC v1 mock HTTP server for PR3 mutation tests..."
+    cat > "$WORK/ghac_mock.py" <<'PY'
+import http.server, json, os, pathlib, re, socketserver, sys, threading, urllib.parse
+
+lock = threading.Lock()
+next_id = 1
+pending = {}
+blobs = {}
+committed = {}
+port_box = [0]
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, fmt, *args):
+        pass
+    def _send(self, code, body=b"", ctype=None, extra=None):
+        self.send_response(code)
+        if ctype:
+            self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        if extra:
+            for k, v in extra.items():
+                self.send_header(k, v)
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/_apis/artifactcache/cache":
+            qs = urllib.parse.parse_qs(parsed.query)
+            keys = qs.get("keys", [""])[0].split(",")
+            ver = qs.get("version", [""])[0]
+            with lock:
+                for k in keys:
+                    cid = committed.get((k, ver))
+                    if cid is not None:
+                        loc = f"http://127.0.0.1:{port_box[0]}/blob/{cid}"
+                        self._send(200, json.dumps({"archiveLocation": loc}).encode(), "application/json")
+                        return
+            self._send(204)
+            return
+        if parsed.path.startswith("/blob/"):
+            cid = int(parsed.path.rsplit("/", 1)[1])
+            with lock:
+                data = blobs.get(cid)
+            if data is None:
+                self._send(404)
+                return
+            rng = self.headers.get("Range")
+            if rng and rng.startswith("bytes="):
+                spec = rng[len("bytes="):]
+                s_str, e_str = spec.split("-", 1)
+                start = int(s_str) if s_str else 0
+                end = int(e_str) if e_str else len(data) - 1
+                end = min(end, len(data) - 1)
+                part = data[start:end + 1]
+                self._send(206, part, "application/octet-stream", {"Content-Range": f"bytes {start}-{end}/{len(data)}"})
+                return
+            self._send(200, data, "application/octet-stream")
+            return
+        self._send(404)
+    def do_POST(self):
+        global next_id
+        ln = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(ln) if ln else b""
+        if self.path == "/_apis/artifactcache/caches":
+            doc = json.loads(body.decode())
+            kv = (doc["key"], doc["version"])
+            with lock:
+                if kv in committed:
+                    self._send(409, b"exists", "text/plain")
+                    return
+                cid = next_id
+                next_id += 1
+                pending[cid] = {"kv": kv, "buf": bytearray()}
+            self._send(200, json.dumps({"cacheId": cid}).encode(), "application/json")
+            return
+        if self.path.startswith("/_apis/artifactcache/caches/"):
+            cid = int(self.path.rsplit("/", 1)[1])
+            with lock:
+                entry = pending.pop(cid, None)
+                if entry is None:
+                    self._send(404)
+                    return
+                blobs[cid] = bytes(entry["buf"])
+                committed[entry["kv"]] = cid
+            self._send(204)
+            return
+        self._send(404)
+    def do_PATCH(self):
+        ln = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(ln) if ln else b""
+        if self.path.startswith("/_apis/artifactcache/caches/"):
+            cid = int(self.path.rsplit("/", 1)[1])
+            cr = self.headers.get("Content-Range", "")
+            start = 0
+            m = re.match(r"bytes (\d+)-(\d+)/\*", cr)
+            if m:
+                start = int(m.group(1))
+            with lock:
+                entry = pending.get(cid)
+                if entry is None:
+                    self._send(404)
+                    return
+                buf = entry["buf"]
+                if len(buf) < start + len(body):
+                    buf.extend(b"\x00" * (start + len(body) - len(buf)))
+                buf[start:start + len(body)] = body
+            self._send(204)
+            return
+        self._send(404)
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+
+srv = Server(("127.0.0.1", 0), Handler)
+port_box[0] = srv.server_address[1]
+pathlib.Path(sys.argv[1]).write_text(str(port_box[0]))
+srv.serve_forever()
+PY
+    python3 "$WORK/ghac_mock.py" "$WORK/ghac_mock.port" &
+    GHAC_MOCK_PID=$!
+    attempts=0
+    until [ -s "$WORK/ghac_mock.port" ]; do
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge 30 ]; then
+            echo "ERROR: GHAC mock server failed to start" >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+    GHAC_MOCK_PORT="$(cat "$WORK/ghac_mock.port")"
+    M6_GHA_VER="mut-m6-$$"
+
+    run_mutation "M6_disable_ghac_l1_hit" \
+        "Disable GHAC L1 reads in RemoteStorage::get_with_raw" \
+        '
+p = root / "src/cache/cache.rs"
+txt = p.read_text()
+old = "async fn get_with_raw(&self, key: &str) -> Result<(Cache, Option<Bytes>)> {\n        match self.operator.read(&normalize_key(key)).await {"
+assert txt.count(old) == 1
+new = "async fn get_with_raw(&self, key: &str) -> Result<(Cache, Option<Bytes>)> {\n        if self.operator.info().scheme().starts_with(\"gha\") { return Ok((Cache::Miss, None)); }\n        match self.operator.read(&normalize_key(key)).await {"
+p.write_text(txt.replace(old, new, 1))
+' \
+        "cargo build --locked --bin sccache && SCCACHE_BIN=\"\$PWD/target/debug/sccache\" ACTIONS_CACHE_URL=\"http://127.0.0.1:${GHAC_MOCK_PORT}/\" ACTIONS_RESULTS_URL=\"http://127.0.0.1:${GHAC_MOCK_PORT}/\" ACTIONS_RUNTIME_TOKEN=\"local-mock-token\" ACTIONS_CACHE_SERVICE_V2=\"\" GITHUB_SERVER_URL=\"https://github.com\" SCCACHE_GHA_ENABLED=\"on\" SCCACHE_GHA_VERSION=\"${M6_GHA_VER}\" REPORT_DIR=\"$WORK/report-m6\" bash tests/integration/scripts/test-ghac-regression.sh --role seed --meta-file \"$WORK/m6-meta.json\" && SCCACHE_BIN=\"\$PWD/target/debug/sccache\" ACTIONS_CACHE_URL=\"http://127.0.0.1:${GHAC_MOCK_PORT}/\" ACTIONS_RESULTS_URL=\"http://127.0.0.1:${GHAC_MOCK_PORT}/\" ACTIONS_RUNTIME_TOKEN=\"local-mock-token\" ACTIONS_CACHE_SERVICE_V2=\"\" GITHUB_SERVER_URL=\"https://github.com\" SCCACHE_GHA_ENABLED=\"on\" SCCACHE_GHA_VERSION=\"${M6_GHA_VER}\" REPORT_DIR=\"$WORK/report-m6\" bash tests/integration/scripts/test-ghac-regression.sh --role verify --meta-file \"$WORK/m6-meta.json\"" \
         "STATS_VERIFY"
 fi
 
