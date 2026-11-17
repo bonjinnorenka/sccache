@@ -1,8 +1,6 @@
 name: extended-rust-checks
 
 on:
-  schedule:
-    - cron: '17 3 * * 1'
   workflow_dispatch:
     inputs:
       rust_toolchain:
@@ -34,7 +32,6 @@ jobs:
     name: extended-rust-checks
     runs-on: ubuntu-24.04
     timeout-minutes: 240
-    continue-on-error: ${{ github.event_name == 'schedule' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -42,7 +39,7 @@ jobs:
       - name: Install selected Rust toolchain
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: ${{ github.event_name == 'schedule' && 'nightly' || inputs.rust_toolchain }}
+          toolchain: ${{ inputs.rust_toolchain }}
 
       - name: Install stable for cache-key comparison
         run: rustup toolchain install --profile minimal --no-self-update stable
@@ -54,14 +51,14 @@ jobs:
         env:
           SCCACHE_BIN: ${{ github.workspace }}/target/debug/sccache
           REPORT_DIR: ${{ github.workspace }}/target/regression-reports/compat-extended
-          RUST_TOOLCHAIN: ${{ github.event_name == 'schedule' && 'nightly' || inputs.rust_toolchain }}
+          RUST_TOOLCHAIN: ${{ inputs.rust_toolchain }}
         run: |
           bash tests/integration/scripts/test-rust-compatibility.sh \
             --toolchain "$RUST_TOOLCHAIN" \
             --alt-toolchain stable
 
       - name: Run selected mutation suite
-        if: github.event_name == 'schedule' || inputs.mutation_suite != 'none'
+        if: inputs.mutation_suite != 'none'
         env:
-          MUTATION_SUITE: ${{ github.event_name == 'schedule' && 'all' || inputs.mutation_suite }}
+          MUTATION_SUITE: ${{ inputs.mutation_suite }}
         run: bash scripts/run-mutation-tests.sh "$MUTATION_SUITE"

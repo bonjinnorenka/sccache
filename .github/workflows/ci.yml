@@ -2,14 +2,13 @@ name: ci
 
 on:
   pull_request:
+  workflow_dispatch:
   push:
     branches:
       - main
       - exp-d-hardening
     tags:
       - 'v*'
-  schedule:
-    - cron: '17 3 * * 1'
 
 permissions:
   contents: read
@@ -341,6 +340,7 @@ jobs:
           cp target/x86_64-unknown-linux-musl/release/sccache README.md LICENSE "release-package/$package/"
           tar -C release-package -czf "$package.tar.gz" "$package"
           sha256sum "$package.tar.gz" > "$package.tar.gz.sha256"
+          sha256sum --check "$package.tar.gz.sha256"
 
       - name: Upload verified release package
         uses: actions/upload-artifact@v7
@@ -354,7 +354,7 @@ jobs:
 
   release:
     name: publish-linux-release
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs:
       - rust-validation
       - cache-regression
@@ -378,7 +378,16 @@ jobs:
           tag_commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
           [[ "$tag_commit" == "$GITHUB_SHA" ]]
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-          [[ "$GITHUB_REF_NAME" == "v$version" ]]
+          [[ -n "$version" && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Cargo.toml has no supported numeric package version: '$version'" >&2
+            exit 1
+          }
+          version_regex="${version//./\\.}"
+          tag_regex="^v${version_regex}(-fork\\.[1-9][0-9]*)?$"
+          [[ "$GITHUB_REF_NAME" =~ $tag_regex ]] || {
+            echo "Tag '$GITHUB_REF_NAME' must be v$version or v$version-fork.<positive revision>" >&2
+            exit 1
+          }
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             echo "Release $GITHUB_REF_NAME already exists; refusing to replace it."
             exit 1
@@ -390,6 +399,17 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: sccache-release-x86_64-unknown-linux-musl-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify downloaded package SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$(find . -maxdepth 1 -type f -name 'sccache-*.tar.gz' -print -quit)"
+          [[ -n "$archive" && -f "$archive.sha256" ]] || {
+            echo "Verified package or its SHA-256 file is missing" >&2
+            exit 1
+          }
+          sha256sum --check "$archive.sha256"
 
       - name: Publish verified Linux x86_64 assets
         env:
