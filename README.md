@@ -348,9 +348,14 @@ Base directories are stripped from the preprocessed source and from the compiler
 In an argument only the places that are expected to spell a pathname are considered: the whole argument, the value of an option written with an `=` (either half of a prefix map), and the value glued to a short option such as `-I`. A base directory appearing anywhere else is left alone, so a definition the compiler bakes into the output verbatim, `-DROOT="/home/user/project"`, still counts. A match also has to end where a path component ends, so a sibling `/home/user/project-docs` is not one.
 
 For Rust compilations, sccache normalizes matching absolute source arguments,
-the source side of `--remap-path-prefix`, Cargo path variables, tracked
-environment dependency values that are absolute paths, and the current working
-directory before computing the cache key.
+the source side of `--remap-path-prefix`, Cargo path variables, and the current
+working directory before computing the cache key. Tracked `rustc` environment
+dependencies (`# env-dep:`, such as values read via `env!`, `option_env!`, or
+`include!(concat!(env!("OUT_DIR"), ...))`) are hashed verbatim so crates that
+embed path-dependent values never false-hit across build roots. When a single
+basedir is active for the request, Rust `.d` dep-info files replace that basedir
+with a marker on store and rewrite it to the consumer's basedir on hit (falling
+back to a compile miss if resolution is ambiguous).
 
 This is similar to ccache's `CCACHE_BASEDIR` and helps when:
 * Building the same project from different directories
@@ -362,11 +367,12 @@ This is similar to ccache's `CCACHE_BASEDIR` and helps when:
 compiler invocation. A relative config-file value prevents the server from
 starting.
 
-**Rust note:** This setting normalizes cache-key inputs; it does not rewrite
-paths embedded in compiled artifacts. If a crate deliberately embeds an
-absolute path, for example with `env!("CARGO_MANIFEST_DIR")`, a cache hit from
-another checkout can contain the path from the compilation that populated the
-cache. Use this opt-in setting only when that behavior is acceptable.
+**Rust note:** This setting normalizes cache-key path inputs and rewrites Rust `.d`
+dep-info paths on hit when a single request basedir is configured; it does not
+rewrite paths already embedded in compiled artifacts (use `--remap-path-prefix`
+for debug/metadata paths). Crates whose tracked `rustc` `env-dep` values differ
+across roots (for example `env!("CARGO_MANIFEST_DIR")` or `env!("OUT_DIR")`)
+intentionally miss so foreign build-root paths are never served from cache.
 
 You can also configure this in the sccache config file:
 

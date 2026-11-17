@@ -1212,6 +1212,7 @@ where
         &self,
         compile: Compile,
     ) -> Result<(CompileResponse, Option<CompileFinished>)> {
+        self.stats.lock().await.compile_requests += 1;
         match self.handle_compile(compile).await? {
             Message::WithBody(Response::Compile(resp), body) => {
                 let finished = match body.await? {

@@ -1768,7 +1768,10 @@ pub fn depinfo_resolve_basedir(content: &[u8], basedir: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Digest, OsStrExt, TimeMacroFinder, depinfo_has_marker, depinfo_mark_basedir, depinfo_resolve_basedir, resolve_compiler_avoiding_wrapper};
+    use super::{
+        Digest, OsStrExt, TimeMacroFinder, depinfo_has_marker, depinfo_mark_basedir,
+        depinfo_resolve_basedir, resolve_compiler_avoiding_wrapper,
+    };
     use std::ffi::{OsStr, OsString};
     use std::path::Path;
 
