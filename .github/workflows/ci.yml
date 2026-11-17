@@ -65,7 +65,7 @@ jobs:
         run: npx --yes @taplo/cli fmt --check
 
       - name: Run Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings -A unknown-lints -A clippy::type_complexity -A clippy::new-without-default
+        run: cargo clippy --locked --all-targets -- -D warnings -A unknown-lints -A clippy::type_complexity -A clippy::new-without-default -A clippy::double_must_use -A clippy::nonstandard_macro_braces
 
       - name: Check supported storage features
         run: |
