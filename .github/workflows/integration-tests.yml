@@ -64,8 +64,14 @@ jobs:
           echo "Coverage report:"
           ls ../../target/integration-coverage/reports/lcov.info -l
 
+      - name: Check Codecov token availability
+        id: codecov_check
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: echo "available=${CODECOV_TOKEN:+true}" >> "$GITHUB_OUTPUT"
+
       - name: Upload coverage results (to Codecov.io)
-        if: ${{ secrets.CODECOV_TOKEN != '' }}
+        if: ${{ steps.codecov_check.outputs.available == 'true' }}
         uses: codecov/codecov-action@v5
         with:
           files: target/integration-coverage/reports/lcov.info

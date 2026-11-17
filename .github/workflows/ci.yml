@@ -232,8 +232,16 @@ jobs:
           grcov . -s . --binary-path $BINARY_DIR --output-type lcov --output-path "${COVERAGE_REPORT_FILE}" --branch $GRCOV_IGNORE_OPTION $GRCOV_EXCLUDE_OPTION
           echo "report=${COVERAGE_REPORT_FILE}" >> $GITHUB_OUTPUT
 
+      - name: Check Codecov token availability
+        if: ${{ ! matrix.no_coverage }}
+        id: codecov_check
+        shell: bash
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: echo "available=${CODECOV_TOKEN:+true}" >> "$GITHUB_OUTPUT"
+
       - name: Upload coverage results (to Codecov.io)
-        if: ${{ ! matrix.no_coverage && secrets.CODECOV_TOKEN != '' }}
+        if: ${{ ! matrix.no_coverage && steps.codecov_check.outputs.available == 'true' }}
         uses: codecov/codecov-action@v5
         with:
           files: ${{ steps.coverage.outputs.report }}
