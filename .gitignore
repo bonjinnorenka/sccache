@@ -12,8 +12,9 @@ target
 /stage
 /*.snap
 
-# Ignore lockfiles of test crates used in the integration tests
+# Ignore lockfiles of test crates used in the integration tests (except pinned regression fixtures)
 tests/**/Cargo.lock
+!tests/fixtures/*/Cargo.lock
 
 # VSCode Workspace files
 **.code-workspace
