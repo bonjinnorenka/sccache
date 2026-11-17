@@ -332,7 +332,7 @@ async fn get_source_files_and_env_deps<T>(
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
     pool: &tokio::runtime::Handle,
-) -> Result<(Vec<PathBuf>, Vec<(OsString, OsString)>)>
+) -> Result<(Vec<PathBuf>, Vec<(OsString, Option<OsString>)>)>
 where
     T: CommandCreatorSync,
 {
@@ -380,7 +380,10 @@ where
 
 /// Parse dependency info from `file` and return a Vec of files mentioned.
 /// Treat paths as relative to `cwd`.
-fn parse_dep_file<T, U>(file: T, cwd: U) -> Result<(Vec<PathBuf>, Vec<(OsString, OsString)>)>
+fn parse_dep_file<T, U>(
+    file: T,
+    cwd: U,
+) -> Result<(Vec<PathBuf>, Vec<(OsString, Option<OsString>)>)>
 where
     T: AsRef<Path>,
     U: AsRef<Path>,
@@ -442,14 +445,13 @@ where
     deps
 }
 
-fn parse_env_dep_info(dep_info: &str) -> Vec<(OsString, OsString)> {
+fn parse_env_dep_info(dep_info: &str) -> Vec<(OsString, Option<OsString>)> {
     let mut env_deps = Vec::new();
     for line in dep_info.lines() {
         if let Some(env_dep) = line.strip_prefix("# env-dep:") {
-            let mut split = env_dep.splitn(2, '=');
-            match (split.next(), split.next()) {
-                (Some(var), Some(val)) => env_deps.push((var.into(), val.into())),
-                _ => env_deps.push((env_dep.into(), "".into())),
+            match env_dep.split_once('=') {
+                Some((var, val)) => env_deps.push((var.into(), Some(val.into()))),
+                None => env_deps.push((env_dep.into(), None)),
             }
         }
     }
@@ -1652,7 +1654,16 @@ where
             // rustc actually tracked (env!/option_env!/include! path lookups)
             // may be baked into the artifact, so normalizing it here could make
             // an artifact embedding another build root's value hit.
-            hash_rust_value(&mut m, val, None);
+            // Distinguish unset (`None` -> `# env-dep:VAR`) from empty (`Some("")` -> `# env-dep:VAR=`).
+            match val {
+                Some(val) => {
+                    m.update(&[1]);
+                    hash_rust_value(&mut m, val, None);
+                }
+                None => {
+                    m.update(&[0]);
+                }
+            }
         }
         let mut env_vars: Vec<_> = env_vars
             .iter()
@@ -3984,6 +3995,21 @@ proc_macro false
         assert_eq!(
             rust_argument_key("/other/src/lib.rs", None, None),
             rust_argument_key("/other/src/lib.rs", None, Some(&first))
+        );
+    }
+
+    #[test]
+    fn test_parse_env_dep_info_distinguishes_unset_and_empty() {
+        let parsed = parse_env_dep_info(
+            "out.d: src/lib.rs\n\n# env-dep:UNSET_VAR\n# env-dep:EMPTY_VAR=\n# env-dep:SET_VAR=a=b\n",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                (OsString::from("UNSET_VAR"), None),
+                (OsString::from("EMPTY_VAR"), Some(OsString::from(""))),
+                (OsString::from("SET_VAR"), Some(OsString::from("a=b"))),
+            ]
         );
     }
 

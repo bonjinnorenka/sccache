@@ -699,37 +699,37 @@ where
                     );
                     Ok(CacheLookupResult::Miss(MissType::Normal))
                 } else {
-                match entry.extract_objects(filtered_outputs.clone(), &pool).await {
-                    Ok(()) => {
-                        let mut ok = true;
-                        for (path, content) in depinfo_rewrites {
-                            if fs::write(&path, &content).is_err() {
-                                ok = false;
-                                break;
+                    match entry.extract_objects(filtered_outputs.clone(), &pool).await {
+                        Ok(()) => {
+                            let mut ok = true;
+                            for (path, content) in depinfo_rewrites {
+                                if fs::write(&path, &content).is_err() {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                Ok(CacheLookupResult::Success(hit, output))
+                            } else {
+                                for fobj in &filtered_outputs {
+                                    let _ = fs::remove_file(&fobj.path);
+                                }
+                                debug!(
+                                    "[{}]: dep-info rewrite failed, treating as miss",
+                                    out_pretty
+                                );
+                                Ok(CacheLookupResult::Miss(MissType::Normal))
                             }
                         }
-                        if ok {
-                            Ok(CacheLookupResult::Success(hit, output))
-                        } else {
-                            for fobj in &filtered_outputs {
-                                let _ = fs::remove_file(&fobj.path);
+                        Err(e) => {
+                            if e.downcast_ref::<DecompressionFailure>().is_some() {
+                                debug!("[{}]: Failed to decompress object", out_pretty);
+                                Ok(CacheLookupResult::Miss(MissType::CacheReadError))
+                            } else {
+                                Err(e)
                             }
-                            debug!(
-                                "[{}]: dep-info rewrite failed, treating as miss",
-                                out_pretty
-                            );
-                            Ok(CacheLookupResult::Miss(MissType::Normal))
                         }
                     }
-                    Err(e) => {
-                        if e.downcast_ref::<DecompressionFailure>().is_some() {
-                            debug!("[{}]: Failed to decompress object", out_pretty);
-                            Ok(CacheLookupResult::Miss(MissType::CacheReadError))
-                        } else {
-                            Err(e)
-                        }
-                    }
-                }
                 }
             }
             (Ok(Ok(Cache::Miss)), duration) => {
@@ -858,13 +858,13 @@ where
                     fmt_duration_as_secs(&duration_compilation)
                 );
                 let start_create_artifact = Instant::now();
-                // Store dep-info with the request's basedir replaced by a
+                // Store Rust dep-info with the request's basedir replaced by a
                 // marker so a hit on another build root can be mapped back
                 // onto that root instead of leaking this root's paths.
                 let basedirs = storage.basedirs();
-                let mut dep_info_tmp = None;
+                let mut dep_info_tmps = Vec::new();
                 let mut outputs = outputs;
-                if basedirs.len() == 1 {
+                if self.language() == Language::Rust && basedirs.len() == 1 {
                     for fobj in &mut outputs {
                         if !fobj.key.ends_with(".d") {
                             continue;
@@ -877,18 +877,20 @@ where
                             continue;
                         }
                         let mut tmp = tempfile::NamedTempFile::new_in(
-                            fobj.path.parent().unwrap_or_else(|| std::path::Path::new("/tmp")),
+                            fobj.path
+                                .parent()
+                                .unwrap_or_else(|| std::path::Path::new("/tmp")),
                         )?;
                         tmp.write_all(&marked)?;
                         let (_, tmp_path) = tmp.keep()?;
                         fobj.path = tmp_path.clone();
-                        dep_info_tmp = Some(tmp_path);
+                        dep_info_tmps.push(tmp_path);
                     }
                 }
                 let mut entry = CacheWrite::from_objects(outputs, &pool)
                     .await
                     .context("failed to zip up compiler outputs")?;
-                if let Some(tmp_path) = dep_info_tmp {
+                for tmp_path in dep_info_tmps {
                     let _ = fs::remove_file(tmp_path);
                 }
 

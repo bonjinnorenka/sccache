@@ -50,56 +50,94 @@ fn test_rust_cargo_build_across_basedirs() -> Result<()> {
     let test_info = SccacheTest::new(None)?;
     let first = test_info.tempdir.path().join("first");
     let second = test_info.tempdir.path().join("second");
+    let first_manifest = test_info.tempdir.path().join("first-manifest");
+    let second_manifest = test_info.tempdir.path().join("second-manifest");
 
     for root in [&first, &second] {
         write_basedirs_crate(root, "basedirs-test", 42)?;
         fs::write(
             root.join("src/main.rs"),
-            "fn main() { println!(\"{}\", basedirs_test::MANIFEST); }\n",
+            "fn main() { println!(\"{}\", basedirs_test::answer()); }\n",
+        )?;
+    }
+    for root in [&first_manifest, &second_manifest] {
+        write_manifest_dir_crate(root, "basedirs-manifest-test", 42)?;
+        fs::write(
+            root.join("src/main.rs"),
+            "fn main() { println!(\"{}\", basedirs_manifest_test::MANIFEST); }\n",
         )?;
     }
     let first = fs::canonicalize(first)?;
     let second = fs::canonicalize(second)?;
+    let first_manifest = fs::canonicalize(first_manifest)?;
+    let second_manifest = fs::canonicalize(second_manifest)?;
 
     stop_sccache()?;
-    let config_path = test_info.tempdir.path().join("config");
-    write_basedirs_config(&config_path, &[first.clone(), second.clone()])?;
     restart_sccache(
         &test_info,
         Some(vec![
-            ("SCCACHE_CONF".into(), config_path.as_os_str().to_owned()),
             // The public launcher and daemon must both ignore this stale value.
             ("SCCACHE_BASEDIRS".into(), "relative/startup-value".into()),
         ]),
     )?;
 
-    for root in [&first, &second] {
-        cargo_build(&test_info, root, None, false)?;
-    }
+    // 1. Safe crate (no env-dep path embedding) must hit across distinct roots
+    //    when each request supplies its own single basedir, and rewrite `.d`.
+    cargo_build(&test_info, &first, Some(first.as_os_str()), false)?;
+    cargo_build(&test_info, &second, Some(second.as_os_str()), false)?;
 
-    let stdout = Command::new(CARGO.as_os_str())
-        .args(["run", "--quiet", "--color=never"])
-        .envs(test_info.env.iter().cloned())
-        .env("CARGO_TARGET_DIR", second.join("target"))
-        .current_dir(&second)
-        .assert()
-        .try_success()?
-        .get_output()
-        .stdout
-        .clone();
-    let stdout =
-        std::str::from_utf8(&stdout).context("cached Cargo binary output was not UTF-8")?;
-    let reported = PathBuf::from(stdout.trim_end_matches(&['\r', '\n'][..]));
-    let reported = fs::canonicalize(&reported)
-        .with_context(|| format!("failed to canonicalize reported path {reported:?}"))?;
-    assert_eq!(reported, first);
-
-    write_basedirs_crate(&second, "basedirs-test", 43)?;
-    cargo_build(&test_info, &second, None, false)?;
+    let second_stdout = cargo_run_stdout(&test_info, &second)?;
+    assert_eq!(second_stdout.trim(), "42");
+    #[cfg(unix)]
+    assert_dep_info_rewritten(&second.join("target"), "basedirs_test", &first, &second)?;
 
     test_info
         .show_stats()?
         .try_stdout(predicates::str::contains(r#""cache_hits":{"counts":{"Rust":1}"#).from_utf8())?
+        .try_stdout(
+            predicates::str::contains(r#""cache_misses":{"counts":{"Rust":1}"#).from_utf8(),
+        )?
+        .try_success()?;
+
+    // Source modification in second must invalidate the cache.
+    write_basedirs_crate(&second, "basedirs-test", 43)?;
+    cargo_build(&test_info, &second, Some(second.as_os_str()), false)?;
+    let second_updated_stdout = cargo_run_stdout(&test_info, &second)?;
+    assert_eq!(second_updated_stdout.trim(), "43");
+
+    test_info
+        .show_stats()?
+        .try_stdout(predicates::str::contains(r#""cache_hits":{"counts":{"Rust":1}"#).from_utf8())?
+        .try_stdout(
+            predicates::str::contains(r#""cache_misses":{"counts":{"Rust":2}"#).from_utf8(),
+        )?
+        .try_success()?;
+
+    // 2. Crate embedding `env!("CARGO_MANIFEST_DIR")` must NOT false-hit across roots.
+    zero_sccache_stats()?;
+    cargo_build(
+        &test_info,
+        &first_manifest,
+        Some(first_manifest.as_os_str()),
+        false,
+    )?;
+    cargo_build(
+        &test_info,
+        &second_manifest,
+        Some(second_manifest.as_os_str()),
+        false,
+    )?;
+
+    let manifest_stdout = cargo_run_stdout(&test_info, &second_manifest)?;
+    let reported = PathBuf::from(manifest_stdout.trim_end_matches(&['\r', '\n'][..]));
+    let reported = fs::canonicalize(&reported)
+        .with_context(|| format!("failed to canonicalize reported path {reported:?}"))?;
+    assert_eq!(reported, second_manifest);
+    assert_ne!(reported, first_manifest);
+
+    test_info
+        .show_stats()?
+        .try_stdout(predicates::str::contains(r#""cache_hits":{"counts":{}"#).from_utf8())?
         .try_stdout(
             predicates::str::contains(r#""cache_misses":{"counts":{"Rust":2}"#).from_utf8(),
         )?
@@ -125,7 +163,8 @@ fn test_request_basedirs_reuse_one_daemon() -> Result<()> {
         .map(fs::canonicalize)
         .collect::<std::io::Result<Vec<_>>>()?;
     let config_path = test_info.tempdir.path().join("config");
-    write_basedirs_config(&config_path, &roots)?;
+    // Single-basedir config fallback allows roots[0] to use fallback while other roots override.
+    write_basedirs_config(&config_path, &[roots[0].clone()])?;
     restart_sccache(
         &test_info,
         Some(vec![(
@@ -144,15 +183,19 @@ fn test_request_basedirs_reuse_one_daemon() -> Result<()> {
         }
         zero_sccache_stats()?;
 
-        // Client-side mode must support both request overrides and the file
-        // fallback supplied by the daemon handshake.
+        // Client-side mode must support both request overrides and the single-basedir
+        // file fallback supplied by the daemon handshake.
         let first_basedir = use_override.then_some(roots[0].as_os_str());
-        let second_basedir = use_override.then_some(roots[1].as_os_str());
         cargo_build(&test_info, &roots[0], first_basedir, client_side)?;
-        cargo_build(&test_info, &roots[1], second_basedir, client_side)?;
+        cargo_build(
+            &test_info,
+            &roots[1],
+            Some(roots[1].as_os_str()),
+            client_side,
+        )?;
 
-        // Both roots are in the file fallback. An empty or nonmatching request
-        // override must replace that fallback, so these are misses rather than hits.
+        // An empty or nonmatching request override must replace that fallback,
+        // so these are misses rather than hits.
         cargo_build(&test_info, &roots[2], Some(OsStr::new("")), client_side)?;
         cargo_build(
             &test_info,
@@ -173,10 +216,40 @@ fn test_request_basedirs_reuse_one_daemon() -> Result<()> {
                 serde_json::from_slice::<serde_json::Value>(output)
                     .ok()
                     .and_then(|stats| stats["basedirs"].as_array().map(Vec::len))
-                    == Some(4)
+                    == Some(1)
             }))?
             .try_success()?;
     }
+
+    // Multi-basedir config fallback (>= 2 basedirs) must fail closed (miss) on restore
+    // when no single-basedir request override is supplied, instead of risking foreign `.d` paths.
+    write_basedirs_config(&config_path, &roots)?;
+    restart_sccache(
+        &test_info,
+        Some(vec![(
+            "SCCACHE_CONF".into(),
+            config_path.as_os_str().to_owned(),
+        )]),
+    )?;
+    for root in &roots[..2] {
+        write_basedirs_crate(root, "request-basedirs-test", 99)?;
+    }
+    zero_sccache_stats()?;
+    cargo_build(&test_info, &roots[0], None, false)?;
+    cargo_build(&test_info, &roots[1], None, false)?;
+    test_info
+        .show_stats()?
+        .try_stdout(predicates::str::contains(r#""cache_hits":{"counts":{}"#).from_utf8())?
+        .try_stdout(
+            predicates::str::contains(r#""cache_misses":{"counts":{"Rust":2}"#).from_utf8(),
+        )?
+        .try_stdout(predicate::function(|output: &[u8]| {
+            serde_json::from_slice::<serde_json::Value>(output)
+                .ok()
+                .and_then(|stats| stats["basedirs"].as_array().map(Vec::len))
+                == Some(4)
+        }))?
+        .try_success()?;
 
     Ok(())
 }
@@ -258,6 +331,22 @@ fn test_concurrent_request_basedirs_do_not_leak() -> Result<()> {
         assert!(build_a.wait()?.success());
         assert!(build_b.wait()?.success());
 
+        #[cfg(unix)]
+        {
+            assert_dep_info_rewritten(
+                &second_a.join("target"),
+                "concurrent_basedirs_a",
+                &first_a,
+                &second_a,
+            )?;
+            assert_dep_info_rewritten(
+                &second_b.join("target"),
+                "concurrent_basedirs_b",
+                &first_b,
+                &second_b,
+            )?;
+        }
+
         test_info
             .show_stats()?
             .try_stdout(
@@ -278,10 +367,85 @@ fn write_basedirs_crate(root: &Path, name: &str, answer: u32) -> Result<()> {
     )?;
     fs::write(
         root.join("src/lib.rs"),
+        format!("pub fn answer() -> u32 {{ {answer} }}\n"),
+    )?;
+    Ok(())
+}
+
+fn write_manifest_dir_crate(root: &Path, name: &str, answer: u32) -> Result<()> {
+    fs::create_dir_all(root.join("src"))?;
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("[package]\nname = {name:?}\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+    )?;
+    fs::write(
+        root.join("src/lib.rs"),
         format!(
             "pub const MANIFEST: &str = env!(\"CARGO_MANIFEST_DIR\");\npub fn answer() -> u32 {{ {answer} }}\n"
         ),
     )?;
+    Ok(())
+}
+
+fn cargo_run_stdout(test_info: &SccacheTest, root: &Path) -> Result<String> {
+    let stdout = Command::new(CARGO.as_os_str())
+        .args(["run", "--quiet", "--color=never"])
+        .envs(test_info.env.iter().cloned())
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .current_dir(root)
+        .assert()
+        .try_success()?
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(stdout).context("cached Cargo binary output was not UTF-8")
+}
+
+#[cfg(unix)]
+fn assert_dep_info_rewritten(
+    target_dir: &Path,
+    crate_prefix: &str,
+    forbidden_root: &Path,
+    expected_root: &Path,
+) -> Result<()> {
+    let deps_dir = target_dir.join("debug").join("deps");
+    let mut found = Vec::new();
+    for entry in fs::read_dir(&deps_dir)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "d")
+            && path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(crate_prefix))
+        {
+            found.push(path);
+        }
+    }
+    anyhow::ensure!(
+        !found.is_empty(),
+        "no dep-info files found for {crate_prefix} in {}",
+        deps_dir.display()
+    );
+    let forbidden = forbidden_root.to_str().unwrap();
+    let expected = expected_root.to_str().unwrap();
+    for path in found {
+        let bytes = fs::read(&path)?;
+        anyhow::ensure!(
+            !bytes.contains(&0x01) && !bytes.contains(&0x02),
+            "unresolved marker byte left in {}",
+            path.display()
+        );
+        let text = String::from_utf8(bytes)?;
+        anyhow::ensure!(
+            !text.contains(forbidden),
+            "foreign root {forbidden} found in {}:\n{text}",
+            path.display()
+        );
+        anyhow::ensure!(
+            text.contains(expected),
+            "expected root {expected} missing in {}:\n{text}",
+            path.display()
+        );
+    }
     Ok(())
 }
 
