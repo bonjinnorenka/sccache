@@ -1461,6 +1461,194 @@ fn test_debuginfo_with_remap_is_reused_across_roots() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[serial]
+fn test_broad_remap_does_not_allow_cross_root_reuse() -> Result<()> {
+    let test_info = SccacheTest::new(None)?;
+    let common = fs::canonicalize(test_info.tempdir.path())?;
+    let slot_a = common.join("slot-a");
+    let slot_b = common.join("slot-b");
+
+    for slot in [&slot_a, &slot_b] {
+        let proj = slot.join("project");
+        fs::create_dir_all(proj.join("src"))?;
+        fs::write(
+            proj.join("Cargo.toml"),
+            "[package]\nname = \"debug_lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(
+            proj.join("src/lib.rs"),
+            "#[inline(never)]\npub fn add(a: u32, b: u32) -> u32 { a.wrapping_add(b) }\n",
+        )?;
+    }
+
+    let proj_a = slot_a.join("project");
+    let proj_b = slot_b.join("project");
+    // One remap for both roots. It removes the shared parent but keeps the
+    // per-root slot directory in the artifact.
+    let flags = format!(
+        "-C debuginfo=2 --remap-path-prefix={}=/shared",
+        common.display()
+    );
+
+    let uncached_target = proj_b.join("target-uncached");
+    run_cargo_build(
+        &test_info,
+        &proj_b,
+        &uncached_target,
+        None,
+        false,
+        &[("RUSTFLAGS", Some(&flags))],
+        false,
+    )?;
+
+    zero_stats()?;
+    run_cargo_build(
+        &test_info,
+        &proj_a,
+        &proj_a.join("target"),
+        Some(slot_a.as_os_str()),
+        false,
+        &[("RUSTFLAGS", Some(&flags))],
+        true,
+    )?;
+    let sa = read_stats(&test_info)?;
+    ensure!(sa.rust_hits == 0 && sa.rust_misses == 1, "{sa:?}");
+
+    zero_stats()?;
+    run_cargo_build(
+        &test_info,
+        &proj_b,
+        &proj_b.join("target"),
+        Some(slot_b.as_os_str()),
+        false,
+        &[("RUSTFLAGS", Some(&flags))],
+        true,
+    )?;
+    let sb = read_stats(&test_info)?;
+    ensure!(
+        sb.rust_hits == 0 && sb.rust_misses == 1,
+        "a remap that leaves the slot directory must miss across roots: {sb:?}"
+    );
+
+    let cached = collect_debug_files_with_ext(&proj_b.join("target"), "libdebug_lib", "rlib")?;
+    let uncached = collect_debug_files_with_ext(&uncached_target, "libdebug_lib", "rlib")?;
+    let slot_a_in_artifact =
+        Path::new("/shared").join(slot_a.file_name().context("slot-a has no file name")?);
+    let slot_b_in_artifact =
+        Path::new("/shared").join(slot_b.file_name().context("slot-b has no file name")?);
+    assert_files_lack_path(&cached, &slot_a_in_artifact)?;
+    assert_files_contain_path(&cached, &slot_b_in_artifact)?;
+
+    #[cfg(target_os = "linux")]
+    for rlib in &cached {
+        ensure!(
+            debug_comp_dirs(rlib)? == debug_comp_dirs(&uncached[0])?,
+            "cached debug info {} differs from the local build",
+            rlib.display()
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_later_broad_remap_does_not_allow_cross_root_reuse() -> Result<()> {
+    let test_info = SccacheTest::new(None)?;
+    let common = fs::canonicalize(test_info.tempdir.path())?;
+    let slot_a = common.join("slot-a");
+    let slot_b = common.join("slot-b");
+
+    for slot in [&slot_a, &slot_b] {
+        let proj = slot.join("project");
+        fs::create_dir_all(proj.join("src"))?;
+        fs::write(
+            proj.join("Cargo.toml"),
+            "[package]\nname = \"debug_lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(
+            proj.join("src/lib.rs"),
+            "#[inline(never)]\npub fn add(a: u32, b: u32) -> u32 { a.wrapping_add(b) }\n",
+        )?;
+    }
+
+    let proj_a = slot_a.join("project");
+    let proj_b = slot_b.join("project");
+    // rustc applies the last matching remap, so the root-specific remap is
+    // overridden by the shared-parent remap that follows it.
+    let flags_a = format!(
+        "-C debuginfo=2 --remap-path-prefix={}=/topsrc --remap-path-prefix={}=/shared",
+        slot_a.display(),
+        common.display()
+    );
+    let flags_b = format!(
+        "-C debuginfo=2 --remap-path-prefix={}=/topsrc --remap-path-prefix={}=/shared",
+        slot_b.display(),
+        common.display()
+    );
+
+    let uncached_target = proj_b.join("target-uncached");
+    run_cargo_build(
+        &test_info,
+        &proj_b,
+        &uncached_target,
+        None,
+        false,
+        &[("RUSTFLAGS", Some(&flags_b))],
+        false,
+    )?;
+
+    zero_stats()?;
+    run_cargo_build(
+        &test_info,
+        &proj_a,
+        &proj_a.join("target"),
+        Some(slot_a.as_os_str()),
+        false,
+        &[("RUSTFLAGS", Some(&flags_a))],
+        true,
+    )?;
+    let sa = read_stats(&test_info)?;
+    ensure!(sa.rust_hits == 0 && sa.rust_misses == 1, "{sa:?}");
+
+    zero_stats()?;
+    run_cargo_build(
+        &test_info,
+        &proj_b,
+        &proj_b.join("target"),
+        Some(slot_b.as_os_str()),
+        false,
+        &[("RUSTFLAGS", Some(&flags_b))],
+        true,
+    )?;
+    let sb = read_stats(&test_info)?;
+    ensure!(
+        sb.rust_hits == 0 && sb.rust_misses == 1,
+        "a later remap that overrides the root remap must miss across roots: {sb:?}"
+    );
+
+    let cached = collect_debug_files_with_ext(&proj_b.join("target"), "libdebug_lib", "rlib")?;
+    let uncached = collect_debug_files_with_ext(&uncached_target, "libdebug_lib", "rlib")?;
+    let slot_a_in_artifact =
+        Path::new("/shared").join(slot_a.file_name().context("slot-a has no file name")?);
+    let slot_b_in_artifact =
+        Path::new("/shared").join(slot_b.file_name().context("slot-b has no file name")?);
+    assert_files_lack_path(&cached, &slot_a_in_artifact)?;
+    assert_files_contain_path(&cached, &slot_b_in_artifact)?;
+
+    #[cfg(target_os = "linux")]
+    for rlib in &cached {
+        ensure!(
+            debug_comp_dirs(rlib)? == debug_comp_dirs(&uncached[0])?,
+            "cached debug info {} differs from the local build",
+            rlib.display()
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 #[serial]

@@ -358,13 +358,14 @@ always names the consuming build root.
 
 Rust normalization is fail-closed: `rustc` writes the working directory and
 source paths into debug info and crate metadata, and a cache hit copies those
-bytes verbatim. sccache therefore only normalizes Rust paths when the
-invocation also passes a `--remap-path-prefix` whose source covers `cwd` and the
-source files, and a remap scope that includes `all` (the default). Otherwise the
-raw paths stay in the key and a different build root misses. Compilations that
-consume a procedural macro also always keep raw paths, because a proc macro can
-read `CARGO_MANIFEST_DIR` or `current_dir()` directly and rustc does not record
-those reads in dep-info.
+bytes verbatim. sccache therefore only normalizes Rust paths when the remap
+that `rustc` finally applies to each of those paths removes the basedir, and a
+remap scope includes `all` (the default). A remap above the basedir keeps the
+per-root directory in the output, and a later remap overrides an earlier,
+more specific one. Otherwise the raw paths stay in the key and a different
+build root misses. Compilations that consume a procedural macro also always
+keep raw paths, because a proc macro can read `CARGO_MANIFEST_DIR` or
+`current_dir()` directly and rustc does not record those reads in dep-info.
 
 This is similar to ccache's `CCACHE_BASEDIR` and helps when:
 * Building the same project from different directories

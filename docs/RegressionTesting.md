@@ -55,7 +55,7 @@ bash scripts/run-mutation-tests.sh all   # Full M1..M6 suite
 
 ## 6. Cache-key behavior documented during implementation
 
-1. **`option_env!` unset vs empty (`src/compiler/rust.rs`)**: `parse_env_dep_info`, `parse_dep_file`, `get_source_files_and_env_deps`, and `generate_hash_key` preserve `Option<OsString>` (`# env-dep:VAR` -> `None`, `# env-dep:VAR=` -> `Some("")`), preventing false hits between unset and empty `option_env!` variables. `CACHE_VERSION` is `8`.
+1. **`option_env!` unset vs empty (`src/compiler/rust.rs`)**: `parse_env_dep_info`, `parse_dep_file`, `get_source_files_and_env_deps`, and `generate_hash_key` preserve `Option<OsString>` (`# env-dep:VAR` -> `None`, `# env-dep:VAR=` -> `Some("")`), preventing false hits between unset and empty `option_env!` variables. `CACHE_VERSION` is `10`.
 2. **Client-side `compile_requests` accounting (`src/server.rs`)**: `SccacheService::compile_direct` (`SCCACHE_CLIENT_SIDE=1`) increments `compile_requests` so `--show-stats` reports request counts consistently across daemon and client-side modes.
 3. **Rust dep-info is local**: upstream 0.19 writes Rust `.d` files from the hashing invocation and no longer caches them. The fork's previous marker/rewrite protocol is therefore not needed; cross-root correctness relies on the cache key normalization plus local generation. Cache entries must not contain `.d` members, and cross-root hits must produce `.d` files naming the consuming root.
 4. **`MultiLevelStorage` stats reset on `--zero-stats`**: `Server::zero_stats` resets `ServerStats` without resetting `MultiLevelStorage`'s `AtomicLevelStats`. Scripts that assert per-leg `multi_level` hit/miss breakdowns restart the `sccache` daemon while preserving the L0 cache directory.

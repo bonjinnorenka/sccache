@@ -432,7 +432,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"9";
+const CACHE_VERSION: &[u8] = b"10";
 
 fn hash_rust_value(digest: &mut Digest, value: &OsStr, basedirs: Option<&[Vec<u8>]>) {
     let encoded = encode_rust_value(value);
@@ -531,15 +531,17 @@ fn has_proc_macro_extern(externs: &[PathBuf]) -> bool {
     })
 }
 
-/// The source side of every `--remap-path-prefix`.
-fn remap_prefixes(arguments: &[(OsString, Option<OsString>)]) -> Vec<PathBuf> {
+/// The source side of every `--remap-path-prefix`, in command-line order.
+fn remap_prefixes(arguments: &[(OsString, Option<OsString>)]) -> Vec<Vec<u8>> {
     arguments
         .iter()
         .filter(|(arg, _)| arg == "--remap-path-prefix")
         .filter_map(|(_, value)| value.as_deref())
-        .filter_map(|value| value.to_str())
-        .filter_map(|value| value.rsplit_once('=').map(|(source, _)| source))
-        .map(PathBuf::from)
+        .filter_map(|value| {
+            let encoded = encode_rust_value(value);
+            let separator = encoded.iter().rposition(|byte| *byte == b'=')?;
+            Some(encoded[..separator].to_vec())
+        })
         .collect()
 }
 
@@ -560,8 +562,47 @@ fn remap_scope_covers_metadata(arguments: &[(OsString, Option<OsString>)]) -> bo
     !explicit || all
 }
 
-fn remap_covers_path(prefixes: &[PathBuf], path: &Path) -> bool {
-    prefixes.iter().any(|prefix| path.starts_with(prefix))
+/// `rustc` applies the last matching `--remap-path-prefix`; earlier matches
+/// are overridden even if their source is more specific.
+fn final_remap_prefix<'a>(path: &Path, prefixes: &'a [Vec<u8>]) -> Option<&'a [u8]> {
+    let encoded = encode_rust_value(path.as_os_str());
+    prefixes
+        .iter()
+        .rev()
+        .find(|prefix| encoded.starts_with(prefix.as_slice()))
+        .map(Vec::as_slice)
+}
+
+/// A remap only makes a path portable when its source consumes the basedir
+/// itself. A source above the basedir leaves the root-specific directory in
+/// the replacement, and a source below it covers only that one path.
+///
+/// `path` must already be known to be under a basedir. Nested basedirs all
+/// have to be consumed, because stripping uses the longest match.
+fn remap_prefix_removes_basedir(prefix: &[u8], path: &[u8], basedirs: &[Vec<u8>]) -> bool {
+    let mut path_is_based = false;
+    for basedir in basedirs {
+        let basedir = std::slice::from_ref(basedir);
+        if strip_path_basedirs(path, basedir).len() == path.len() {
+            continue;
+        }
+        path_is_based = true;
+        if strip_path_basedirs(prefix, basedir).len() == prefix.len() {
+            return false;
+        }
+    }
+    path_is_based
+}
+
+fn path_is_remapped_across_roots(path: &Path, basedirs: &[Vec<u8>], prefixes: &[Vec<u8>]) -> bool {
+    let encoded = encode_rust_value(path.as_os_str());
+    // Paths outside every basedir keep their absolute path in the key, so a
+    // different source location already forces a miss.
+    if strip_path_basedirs(encoded, basedirs).len() == encoded.len() {
+        return true;
+    }
+    final_remap_prefix(path, prefixes)
+        .is_some_and(|prefix| remap_prefix_removes_basedir(prefix, encoded, basedirs))
 }
 
 /// Paths that rustc embeds in the output can only be normalized across roots
@@ -570,9 +611,10 @@ fn remap_covers_path(prefixes: &[PathBuf], path: &Path) -> bool {
 /// `rustc` writes the working directory and source names into debug info and
 /// crate metadata. A cache hit copies those bytes verbatim, so stripping the
 /// basedir from the cache key alone would hand `root-b` an artifact that names
-/// `root-a`. Cross-root reuse therefore needs a `--remap-path-prefix` that
-/// covers the paths basedirs strips and a scope that includes metadata.
-/// Without both, keep the raw paths in the key and let the compile miss.
+/// `root-a`. Cross-root reuse therefore needs the final `--remap-path-prefix`
+/// for every such path to remove the basedir, and a scope that includes
+/// metadata. Without both, keep the raw paths in the key and let the compile
+/// miss.
 fn effective_basedirs<'a>(
     basedirs: Option<&'a [Vec<u8>]>,
     cwd: &Path,
@@ -591,8 +633,8 @@ fn effective_basedirs<'a>(
     let prefixes = remap_prefixes(arguments);
     let cwd_encoded = encode_rust_value(cwd.as_os_str());
     let cwd_is_normalized = strip_path_basedirs(cwd_encoded, basedirs).len() != cwd_encoded.len();
-    if cwd_is_normalized && !remap_covers_path(&prefixes, cwd) {
-        debug!("not normalizing Rust paths: cwd is not covered by --remap-path-prefix");
+    if cwd_is_normalized && !path_is_remapped_across_roots(cwd, basedirs, &prefixes) {
+        debug!("not normalizing Rust paths: cwd is not removed by the final --remap-path-prefix");
         return None;
     }
     Some(basedirs)
@@ -604,14 +646,9 @@ fn sources_are_remapped(
     arguments: &[(OsString, Option<OsString>)],
 ) -> bool {
     let prefixes = remap_prefixes(arguments);
-    sources.iter().all(|source| {
-        let encoded = encode_rust_value(source.as_os_str());
-        // Only paths the basedir actually strips can be shared across roots.
-        // Other sources keep their absolute path in the cache key, so a
-        // different path already forces a miss.
-        strip_path_basedirs(encoded, basedirs).len() == encoded.len()
-            || remap_covers_path(&prefixes, source)
-    })
+    sources
+        .iter()
+        .all(|source| path_is_remapped_across_roots(source, basedirs, &prefixes))
 }
 
 /// Run `rustc --emit=dep-info` to get the list of source files and env-deps.
@@ -4628,6 +4665,50 @@ foo.rs:
         let outside_remap = os(&[("--remap-path-prefix", Some("/elsewhere=/topsrc"))]);
         assert!(effective_basedirs(Some(basedirs), cwd, &outside_remap, &[]).is_none());
 
+        let broad_remap = os(&[("--remap-path-prefix", Some("/work=/shared"))]);
+        assert!(
+            effective_basedirs(Some(basedirs), cwd, &broad_remap, &[]).is_none(),
+            "a remap above the basedir leaves the root directory in the output"
+        );
+
+        let overridden_remap = os(&[
+            (
+                "--remap-path-prefix",
+                Some("/work/root/project=/topsrc/project"),
+            ),
+            ("--remap-path-prefix", Some("/work=/shared")),
+        ]);
+        assert!(
+            effective_basedirs(Some(basedirs), cwd, &overridden_remap, &[]).is_none(),
+            "the last matching remap overrides the root-specific one"
+        );
+
+        let remap_overridden = os(&[
+            ("--remap-path-prefix", Some("/work=/shared")),
+            (
+                "--remap-path-prefix",
+                Some("/work/root/project=/topsrc/project"),
+            ),
+        ]);
+        assert!(
+            effective_basedirs(Some(basedirs), cwd, &remap_overridden, &[]).is_some(),
+            "a root-specific remap remains effective when it is last"
+        );
+
+        let basedir_remap = os(&[("--remap-path-prefix", Some("/work/root=/topsrc"))]);
+        assert!(effective_basedirs(Some(basedirs), cwd, &basedir_remap, &[]).is_some());
+
+        assert!(!sources_are_remapped(
+            &[PathBuf::from("/work/root/project/src/lib.rs")],
+            basedirs,
+            &overridden_remap
+        ));
+        assert!(sources_are_remapped(
+            &[PathBuf::from("/work/root/project/src/lib.rs")],
+            basedirs,
+            &remap_overridden
+        ));
+
         assert!(has_proc_macro_extern(&[PathBuf::from(format!(
             "libpm.{}",
             DLL_EXTENSION
@@ -4663,6 +4744,27 @@ foo.rs:
                 &remap
             ),
             "a dependency outside every basedir keeps its absolute path in the key"
+        );
+    }
+
+    #[test]
+    fn test_rust_basedirs_require_remap_to_consume_longest_basedir() {
+        let basedirs = [b"/work/".to_vec(), b"/work/root/".to_vec()];
+        let cwd = Path::new("/work/root/project");
+        let os = |value: &str| {
+            vec![(
+                OsString::from("--remap-path-prefix"),
+                Some(OsString::from(value)),
+            )]
+        };
+
+        assert!(
+            effective_basedirs(Some(&basedirs), cwd, &os("/work=/shared"), &[]).is_none(),
+            "the shorter basedir must not hide the unstripped root directory"
+        );
+        assert!(
+            effective_basedirs(Some(&basedirs), cwd, &os("/work/root=/topsrc"), &[]).is_some(),
+            "a remap that consumes the longest basedir is sufficient"
         );
     }
 
