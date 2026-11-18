@@ -1275,6 +1275,7 @@ where
 
         // Resolve compiler avoiding ccache wrappers to prevent double-caching.
         let resolved_exe = resolve_compiler_avoiding_wrapper(exe, env_vars);
+        let storage = service.storage_for_request(env_vars)?;
 
         let out = match cacheable {
             Cacheable::No => {
@@ -1324,6 +1325,7 @@ where
                                     .chain([("SCCACHE_DIRECT".into(), "false".into())].iter())
                                     .cloned()
                                     .collect::<Vec<_>>(),
+                                storage,
                             )
                             .await
                         }
