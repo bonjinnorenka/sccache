@@ -16,9 +16,15 @@ runs:
   using: composite
   steps:
     - shell: bash
+      env:
+        SELECTED_TOOLCHAIN: ${{ inputs.toolchain || 'stable' }}
       run: |
-        set -x
-        rustup override set ${{ inputs.toolchain || 'stable' }}
+        set -euxo pipefail
+        # Runner images may ship different preinstalled stable versions during a rollout.
+        if [[ "$SELECTED_TOOLCHAIN" == stable ]]; then
+          rustup update stable --no-self-update
+        fi
+        rustup override set "$SELECTED_TOOLCHAIN"
         ${{ inputs.target && format('rustup target add {0}', inputs.target) }}
         ${{ inputs.components && format('rustup component add {0}', inputs.components) }}
         cargo --version
