@@ -1,0 +1,59 @@
+name: Sync upstream-main
+
+# Run this from the default branch. Do not use a PAT or a deploy key to push:
+# pushes authenticated with this repository's GITHUB_TOKEN do not trigger CI.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Fast-forward upstream-main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fast-forward upstream-main to mozilla/sccache main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Fetch the upstream commit without creating a local merge commit.
+          git fetch --no-tags \
+            https://github.com/mozilla/sccache.git refs/heads/main
+          upstream_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
+
+          # Fetch the fork's existing mirror. Never rewrite diverged history.
+          git fetch --no-tags origin refs/heads/upstream-main
+          current_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
+
+          echo "Current mirror: $current_sha"
+          echo "Upstream main:  $upstream_sha"
+
+          if [[ "$current_sha" == "$upstream_sha" ]]; then
+            echo "upstream-main is already up to date."
+            exit 0
+          fi
+
+          if ! git merge-base --is-ancestor "$current_sha" "$upstream_sha"; then
+            echo "::error::upstream-main cannot be fast-forwarded. Refusing to force-push or create a merge commit."
+            exit 1
+          fi
+
+          # The checkout action configures origin to use this workflow's
+          # GITHUB_TOKEN. A push using that token does not trigger push CI.
+          git push origin "$upstream_sha:refs/heads/upstream-main"
+          echo "Synced upstream-main to $upstream_sha"
