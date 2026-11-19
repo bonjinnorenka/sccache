@@ -218,13 +218,15 @@ if [ "$ROLE" = "seed" ]; then
 
     "$SCCACHE_BIN" --stop-server >/dev/null 2>&1 || true
 
-    python3 - "$META_FILE" "$C_COUNT" "$SCCACHE_GHA_VERSION" "$SLOT_A" "$FETCH_SEC" <<'PY'
+    python3 - "$META_FILE" "$C_COUNT" "$SCCACHE_GHA_VERSION" "$SLOT_A" "$FETCH_SEC" "$RUSTC_VER" "$CARGO_VER" <<'PY'
 import json, sys
-meta_path, expected_c, gha_ver, slot_a, fetch_sec = sys.argv[1:6]
+meta_path, expected_c, gha_ver, slot_a, fetch_sec, rustc_ver, cargo_ver = sys.argv[1:8]
 with open(meta_path, "w", encoding="utf-8") as fh:
     json.dump({
         "expected_cacheable": int(expected_c),
         "gha_version": gha_ver,
+        "rustc_version": rustc_ver,
+        "cargo_version": cargo_ver,
         "slot_a_root": slot_a,
         "fetch_sec": float(fetch_sec),
     }, fh, indent=2)
@@ -253,6 +255,21 @@ if [ "$SCCACHE_GHA_VERSION" != "$SEED_GHA_VER" ]; then
     echo "ERROR: SCCACHE_GHA_VERSION mismatch (verify=$SCCACHE_GHA_VERSION seed=$SEED_GHA_VER)" >&2
     exit 1
 fi
+
+# Fail before any compilation if the seed and verify runners selected different Rust toolchains.
+python3 - "$META_FILE" "$RUSTC_VER" "$CARGO_VER" <<'PY'
+import json, sys
+meta_path, current_rustc, current_cargo = sys.argv[1:]
+with open(meta_path, encoding="utf-8") as fh:
+    meta = json.load(fh)
+for key, current in (("rustc_version", current_rustc), ("cargo_version", current_cargo)):
+    seeded = meta.get(key)
+    if seeded != current:
+        raise SystemExit(
+            f"ERROR: GHAC toolchain mismatch ({key}): seed={seeded!r}, verify={current!r}; "
+            "cross-job cache verification requires identical Rust and Cargo versions."
+        )
+PY
 
 SLOT_B="$WORK_ROOT/cross-verify/slot-b"
 L0_B="$WORK_ROOT/l0-verify"
